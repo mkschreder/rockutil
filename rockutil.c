@@ -734,61 +734,25 @@ static int wait_for_loader_mode(struct rkusb *u)
 			continue;
 
 		/*
-		 * 8 consecutive Loader-mode detections confirmed.
+		 * 8 consecutive stable enumerations confirmed.  usbplug is up.
 		 *
-		 * 8 consecutive Loader-mode detections confirmed.
-		 * Close the MaskROM handle and open the freshly-detected
-		 * Loader device with no intervening delay.
+		 * Do NOT close or reopen the handle.  On RV1103/RV1106 (and
+		 * similar SoCs) usbplug starts in-place: same USB address,
+		 * same interface 0, same bulk endpoints.  The existing handle
+		 * is fully valid for Loader-mode BOT commands.
 		 *
-		 * The device auto-boot watchdog fires around T=750-800 ms
-		 * from upload completion.  We have 8 × 50 ms = 400 ms of
-		 * polls plus however long the Loader took to appear, so we
-		 * are at roughly T=400-450 ms — well before the watchdog.
-		 * Any artificial delay here would push us past the deadline.
+		 * close + reopen would call libusb_release_interface followed
+		 * by libusb_claim_interface.  The kernel's claim_interface path
+		 * disables and re-enables the endpoints and may send
+		 * SET_INTERFACE(0,0) to the device.  usbplug processes
+		 * SET_INTERFACE asynchronously; the first CBW write arrives
+		 * while the endpoint is still recovering and fails with
+		 * LIBUSB_ERROR_IO — exactly the failure we observed.
 		 *
-		 * Strategy:
-		 *   1. Close the MaskROM handle now.
-		 *   2. Re-enumerate immediately to get the current
-		 *      libusb_device* (handles the rare case where the device
-		 *      re-enumerated to a new address during the 8 polls).
-		 *   3. Open the Loader device with a fresh handle
-		 *      (InitializeUsb never calls clear_halt — see
-		 *      open_and_ensure_loader).
-		 *   4. Return — caller sends GetFlashInfo immediately.
+		 * Data toggles are already in sync: the MaskROM phase used
+		 * only CONTROL transfers, leaving the host-side BULK toggles
+		 * at DATA0; usbplug also initialises its bulk toggles to DATA0.
 		 */
-		fprintf(stderr, "  [stabilize] closing MaskROM handle, "
-		        "opening Loader immediately...\n");
-		rkusb_close(u);           /* releases interface; sets iface->dev.driver=NULL */
-
-		/* Open the Loader (possibly at a new USB address). */
-		{
-			struct rkdev_list list2 = {0};
-			rkusb_enumerate(&list2);
-			int opened = -ENODEV;
-			for (size_t i = 0; i < list2.count && opened != 0; ++i) {
-				const struct rkdev_desc *d = &list2.devs[i];
-				fprintf(stderr,
-				        "  [open] trying VID=0x%04X PID=0x%04X"
-				        " bcdUSB=0x%04X\n",
-				        d->vid, d->pid, d->bcdUSB);
-				opened = rkusb_open(u, d);
-				if (opened < 0)
-					fprintf(stderr,
-					        "  [open] failed: %s (%d)\n",
-					        libusb_error_name(opened), opened);
-			}
-			rkusb_free_list(&list2);
-			if (opened != 0) {
-				fprintf(stderr,
-				        "No Loader device found immediately "
-				        "after closing MaskROM handle.\n");
-				consec = 0;
-				continue;   /* retry the outer loop */
-			}
-		}
-
-		/* Match original: no clear_halt here (see open_and_ensure_loader). */
-
 		u->desc.usb_type = RKUSB_MODE_LOADER;
 		fprintf(stderr,
 		        "Loader mode ready "
