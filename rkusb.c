@@ -236,27 +236,15 @@ int rkusb_enumerate(struct rkdev_list *out)
 		r->device_type = entry ? entry->device_type : RKDEV_NONE;
 
 		/*
-		 * Mode classification: the KNOWN_DEVICES table is the primary
-		 * authority for known PIDs.
+		 * Mode classification — step 1: PID table / interface detection.
 		 *
-		 * The assumption "MaskROM has no bulk interface" is FALSE for
-		 * newer Rockchip SoCs.  RV1103/RV1106 (and RK3588 family) expose
-		 * the full class-0xFF/0x06/0x05 Rockusb interface with bulk IN
-		 * and OUT endpoints even in MaskROM mode.  The MaskROM firmware
-		 * does NOT implement Bulk-Only Transport — it only accepts vendor
-		 * control transfers (wIndex=0x0471/0x0472) to receive the DDR
-		 * init blob and the usbplug loader.  Sending any BOT CBW to the
-		 * MaskROM bulk OUT returns LIBUSB_ERROR_IO immediately and, on
-		 * some SoCs, wedges the control endpoint so the handshake can
-		 * never recover.
+		 * The KNOWN_DEVICES table is the primary authority for known PIDs.
+		 * Interface detection is the fallback for unknown PIDs only.
 		 *
-		 * For known PIDs, the table is always correct: the Rockchip PID
-		 * assignment is stable (e.g. 0x110C = RV1106 MaskROM, 0x110D =
-		 * RV1106 Loader).  Interface presence cannot distinguish the two
-		 * on these SoCs, so we must not override the table.
-		 *
-		 * For unknown PIDs (no table entry, but a Rockchip VID), interface
-		 * detection is the only discriminator available.
+		 * Background: newer Rockchip SoCs (RV1103/RV1106, RK3588 family)
+		 * expose the full class-0xFF/0x06/0x05 Rockusb bulk interface even
+		 * in MaskROM mode, so interface presence cannot distinguish the two
+		 * modes — the table must be trusted for known PIDs.
 		 */
 		if (entry)
 			r->usb_type = entry->usb_type;
@@ -264,6 +252,35 @@ int rkusb_enumerate(struct rkdev_list *out)
 			r->usb_type = RKUSB_MODE_LOADER;
 		else
 			r->usb_type = RKUSB_MODE_MASKROM;
+
+		/*
+		 * Mode classification — step 2: string-descriptor tiebreaker.
+		 *
+		 * Some SoCs (observed on RV1106) use the SAME PID for both
+		 * MaskROM and the usbplug loader:
+		 *
+		 *   MaskROM  (device 105 in dmesg): PID=0x110C, iMfr=0, iProd=0
+		 *   usbplug  (device 106 in dmesg): PID=0x110C, iMfr=1, iProd=2
+		 *                                   Product="USB-MSC" Mfr="RockChip"
+		 *
+		 * The table alone classifies both as MASKROM (0x110C entry).
+		 * The USB device descriptor fields iManufacturer and iProduct are
+		 * string-descriptor INDICES, not the string content.  Reading them
+		 * via libusb_get_device_descriptor() requires NO open() call and
+		 * does not disturb the device.
+		 *
+		 * Rockchip MaskROM firmware never configures string descriptors:
+		 * iManufacturer=0, iProduct=0, iSerialNumber=0.
+		 * Rockchip usbplug/Loader firmware always configures at least one
+		 * non-zero string index.
+		 *
+		 * Therefore: if the table says MASKROM but the device descriptor
+		 * has a non-zero iManufacturer or iProduct, the device is actually
+		 * running usbplug and should be classified as LOADER.
+		 */
+		if (r->usb_type == RKUSB_MODE_MASKROM &&
+		    (d.iManufacturer != 0 || d.iProduct != 0))
+			r->usb_type = RKUSB_MODE_LOADER;
 
 		r->bus = libusb_get_bus_number(dev);
 		int plen = libusb_get_port_numbers(dev, r->port_path,
