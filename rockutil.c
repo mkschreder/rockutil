@@ -677,90 +677,106 @@ static int maskrom_handshake(struct rkusb *u, const struct rkboot *boot)
 static int wait_for_loader_mode(struct rkusb *u)
 {
 	/*
-	 * Drop the MaskROM handle immediately so libusb_get_device_list
-	 * no longer returns the stale 0x110C reference.
+	 * Drop the MaskROM handle so libusb_get_device_list no longer
+	 * returns the stale reference for the old device address.
 	 */
 	rkusb_close(u);
 
-	int      consec  = 0;
-	uint16_t ldr_vid = 0, ldr_pid = 0, ldr_bcd = 0;
+	/*
+	 * Poll for up to 30 s (600 × 50 ms).  As soon as a LOADER-mode
+	 * device appears, attempt to open it immediately — no stability
+	 * count is required.  The old 3-consecutive-poll rule was the
+	 * primary failure cause: usbplug performs several USB resets
+	 * during flash initialisation, each of which disconnects and
+	 * reconnects the device.  Every disconnect reset the counter to
+	 * zero, so 3 back-to-back stable polls were never accumulated
+	 * within the old 6 s window.
+	 *
+	 * If the open attempt fails (device still initialising), we log
+	 * the error and continue polling.  State changes (new device,
+	 * disappearance, mode change) are printed so that future issues
+	 * are self-diagnosing.
+	 */
 
-	for (int tries = 0; tries < 120; ++tries) {
+	/* sentinel: "haven't seen anything yet" */
+	uint16_t prev_vid  = 0;
+	uint16_t prev_pid  = 0;
+	uint16_t prev_type = 0xFFFF;
+
+	for (int tries = 0; tries < 600; ++tries) {
 		usleep(50 * 1000);
 
 		struct rkdev_list list = {0};
 		rkusb_enumerate(&list);
 
-		/*
-		 * Skip MASKROM devices.  After the handshake we want only
-		 * the Loader (usbplug) device.  For RV1106 that is PID 0x110D
-		 * (RKUSB_MODE_LOADER in the known-device table).
-		 */
-		bool found = false;
+		bool              found_loader = false;
+		struct rkdev_desc loader_copy  = {0};
+		libusb_device    *loader_dev   = NULL;
+
 		for (size_t i = 0; i < list.count; ++i) {
 			const struct rkdev_desc *d = &list.devs[i];
-			if (d->usb_type != RKUSB_MODE_LOADER)
-				continue;
-			ldr_vid = d->vid;
-			ldr_pid = d->pid;
-			ldr_bcd = d->bcdUSB;
-			found   = true;
-			break;
+
+			/* Log every state change for diagnostics. */
+			if (d->vid != prev_vid || d->pid != prev_pid ||
+			    d->usb_type != prev_type) {
+				fprintf(stderr,
+				        "  [T+%.1fs] VID=0x%04X PID=0x%04X"
+				        " mode=%s\n",
+				        (tries + 1) * 0.05,
+				        d->vid, d->pid,
+				        rkusb_mode_name(d->usb_type));
+				prev_vid  = d->vid;
+				prev_pid  = d->pid;
+				prev_type = d->usb_type;
+			}
+
+			if (!found_loader &&
+			    d->usb_type == RKUSB_MODE_LOADER) {
+				found_loader = true;
+				loader_copy  = *d;
+				/*
+				 * Hold an extra reference so the device object
+				 * remains valid after rkusb_free_list() decrements
+				 * the enumerate-time reference.
+				 */
+				loader_dev = libusb_ref_device(d->dev);
+			}
 		}
+
+		if (list.count == 0 && prev_type != 0xFFFF) {
+			fprintf(stderr,
+			        "  [T+%.1fs] no Rockchip devices visible\n",
+			        (tries + 1) * 0.05);
+			prev_vid  = 0;
+			prev_pid  = 0;
+			prev_type = 0xFFFF;
+		}
+
 		rkusb_free_list(&list);
 
-		if (!found) {
-			if (consec > 0)
-				fprintf(stderr,
-				        "  [wait %.1fs] Loader disappeared "
-				        "(count reset)\n",
-				        (tries + 1) * 0.05);
-			consec = 0;
-			continue;
-		}
-
-		consec++;
-		fprintf(stderr,
-		        "  [wait %.1fs] VID=0x%04X PID=0x%04X "
-		        "bcdUSB=0x%04X (consecutive %d/3)\n",
-		        (tries + 1) * 0.05,
-		        ldr_vid, ldr_pid, ldr_bcd, consec);
-
-		if (consec < 3)
+		if (!found_loader)
 			continue;
 
-		/* 3 stable Loader appearances — open a fresh handle. */
-		{
-			struct rkdev_list list2 = {0};
-			rkusb_enumerate(&list2);
-			int opened = -ENODEV;
-			for (size_t i = 0; i < list2.count && opened != 0; ++i) {
-				const struct rkdev_desc *d = &list2.devs[i];
-				if (d->usb_type != RKUSB_MODE_LOADER)
-					continue;
-				fprintf(stderr,
-				        "  [open] VID=0x%04X PID=0x%04X"
-				        " bcdUSB=0x%04X\n",
-				        d->vid, d->pid, d->bcdUSB);
-				opened = rkusb_open(u, d);
-				if (opened < 0)
-					fprintf(stderr,
-					        "  [open] failed: %s (%d)\n",
-					        libusb_error_name(opened),
-					        opened);
-			}
-			rkusb_free_list(&list2);
-			if (opened != 0) {
-				fprintf(stderr,
-				        "Loader vanished before open — retrying.\n");
-				consec = 0;
-				continue;
-			}
+		/* Try to open immediately — no stability wait. */
+		loader_copy.dev = loader_dev; /* still valid: extra ref held */
+		int opened = rkusb_open(u, &loader_copy);
+		libusb_unref_device(loader_dev); /* release our extra ref */
+
+		if (opened < 0) {
+			fprintf(stderr,
+			        "  [open] VID=0x%04X PID=0x%04X failed: %s"
+			        " — will retry\n",
+			        loader_copy.vid, loader_copy.pid,
+			        libusb_error_name(opened));
+			/* Force re-logging on next appearance. */
+			prev_type = 0xFFFF;
+			continue;
 		}
 
 		fprintf(stderr,
 		        "Loader mode ready "
-		        "(VID=0x%04X PID=0x%04X ep_in=0x%02X ep_out=0x%02X iface=%d)\n",
+		        "(VID=0x%04X PID=0x%04X"
+		        " ep_in=0x%02X ep_out=0x%02X iface=%d)\n",
 		        u->desc.vid, u->desc.pid,
 		        u->ep_in, u->ep_out, u->interface);
 		return 0;
@@ -844,11 +860,6 @@ handshake:
 	if (rc < 0)
 		return rc;
 
-	/*
-	 * wait_for_loader_mode() polls for 8 consecutive Loader-mode
-	 * detections, then closes the MaskROM handle and immediately opens
-	 * the Loader — matching the original tool's zero-delay behaviour.
-	 */
 	fprintf(stderr, "Waiting for Loader to come up...\n");
 	return wait_for_loader_mode(u);
 }
