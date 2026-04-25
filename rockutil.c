@@ -654,37 +654,34 @@ static int maskrom_handshake(struct rkusb *u, const struct rkboot *boot)
 }
 
 /*
- * Wait for the Loader to be stable, then mark the existing handle as
- * being in Loader mode.
+ * After the 472 (usbplug) upload completes the MaskROM jumps to the
+ * usbplug entry point.  usbplug re-initialises the USB controller and
+ * re-enumerates as a LOADER-mode device (e.g. PID 0x110D for RV1106).
  *
- * On RV1103/RV1106 (and similar SoCs) the device does NOT re-enumerate
- * after the 472 upload.  usbplug starts in-place at the SAME USB address,
- * same interface (0), same bulk endpoints (ep_in=0x81, ep_out=0x02).
+ * The MaskROM handle must be closed BEFORE polling.  While it is open,
+ * libusb holds a reference to the underlying libusb_device for the
+ * MaskROM PID (0x110C).  libusb_get_device_list returns referenced
+ * devices even after the physical device disconnects, so the stale
+ * 0x110C entry appears first in the enumeration results and masks the
+ * new 0x110D (Loader) device.  Closing the handle drops that reference
+ * so the device list reflects only what is physically present.
  *
- * The MaskROM handle `u` is therefore still valid after the handshake:
- * - The file descriptor is still open.
- * - Interface 0 is still claimed (libusb_claim_interface was not released).
- * - The HOST-SIDE bulk endpoint data toggles are at DATA0 — the MaskROM
- *   phase used only CONTROL transfers, so the BULK toggles were never
- *   touched after the initial libusb_claim_interface which resets them.
- * - usbplug also initialises its endpoint data toggles to DATA0 on startup.
- *   Both sides agree: DATA0.
- *
- * Closing and reopening (the previous approach) caused
- * libusb_release_interface → usb_disable_endpoint, then
- * libusb_claim_interface → usb_driver_claim_interface → SET_INTERFACE(0,0)
- * sent to the device.  usbplug processes SET_INTERFACE asynchronously;
- * the first CBW write arrives while the endpoint is still recovering →
- * LIBUSB_ERROR_IO on the bulk write.
- *
- * Solution: do NOT close or reopen.  After 8 consecutive detections
- * (via enumerate-only, no opens), mark the handle as Loader and return.
- * The caller uses the same fd for all subsequent BOT commands.
+ * The polling loop waits for a LOADER-mode device (usb_type ==
+ * RKUSB_MODE_LOADER) and skips any MASKROM devices that may transiently
+ * reappear.  Three consecutive stable detections are sufficient; fewer
+ * would risk opening the device before its BOT endpoint is ready, more
+ * would risk missing the usbplug window before its watchdog fires.
  *
  * Polling budget: 120 × 50 ms = 6 seconds.
  */
 static int wait_for_loader_mode(struct rkusb *u)
 {
+	/*
+	 * Drop the MaskROM handle immediately so libusb_get_device_list
+	 * no longer returns the stale 0x110C reference.
+	 */
+	rkusb_close(u);
+
 	int      consec  = 0;
 	uint16_t ldr_vid = 0, ldr_pid = 0, ldr_bcd = 0;
 
@@ -695,16 +692,15 @@ static int wait_for_loader_mode(struct rkusb *u)
 		rkusb_enumerate(&list);
 
 		/*
-		 * Count any Rockchip device appearance as a Loader detection.
-		 * After the handshake (472 upload) the MaskROM is gone; the
-		 * only device that can appear at this VID:PID is the Loader.
-		 * The original CRKScan::Wait(type=LOADER) also makes no
-		 * interface-based MaskROM/Loader distinction — it simply
-		 * counts appearances of the right VID:PID on the same bus.
+		 * Skip MASKROM devices.  After the handshake we want only
+		 * the Loader (usbplug) device.  For RV1106 that is PID 0x110D
+		 * (RKUSB_MODE_LOADER in the known-device table).
 		 */
 		bool found = false;
 		for (size_t i = 0; i < list.count; ++i) {
 			const struct rkdev_desc *d = &list.devs[i];
+			if (d->usb_type != RKUSB_MODE_LOADER)
+				continue;
 			ldr_vid = d->vid;
 			ldr_pid = d->pid;
 			ldr_bcd = d->bcdUSB;
@@ -716,7 +712,7 @@ static int wait_for_loader_mode(struct rkusb *u)
 		if (!found) {
 			if (consec > 0)
 				fprintf(stderr,
-				        "  [wait %.1fs] device disappeared "
+				        "  [wait %.1fs] Loader disappeared "
 				        "(count reset)\n",
 				        (tries + 1) * 0.05);
 			consec = 0;
@@ -726,34 +722,42 @@ static int wait_for_loader_mode(struct rkusb *u)
 		consec++;
 		fprintf(stderr,
 		        "  [wait %.1fs] VID=0x%04X PID=0x%04X "
-		        "bcdUSB=0x%04X (consecutive %d/8)\n",
+		        "bcdUSB=0x%04X (consecutive %d/3)\n",
 		        (tries + 1) * 0.05,
 		        ldr_vid, ldr_pid, ldr_bcd, consec);
 
-		if (consec < 8)
+		if (consec < 3)
 			continue;
 
-		/*
-		 * 8 consecutive stable enumerations confirmed.  usbplug is up.
-		 *
-		 * Do NOT close or reopen the handle.  On RV1103/RV1106 (and
-		 * similar SoCs) usbplug starts in-place: same USB address,
-		 * same interface 0, same bulk endpoints.  The existing handle
-		 * is fully valid for Loader-mode BOT commands.
-		 *
-		 * close + reopen would call libusb_release_interface followed
-		 * by libusb_claim_interface.  The kernel's claim_interface path
-		 * disables and re-enables the endpoints and may send
-		 * SET_INTERFACE(0,0) to the device.  usbplug processes
-		 * SET_INTERFACE asynchronously; the first CBW write arrives
-		 * while the endpoint is still recovering and fails with
-		 * LIBUSB_ERROR_IO — exactly the failure we observed.
-		 *
-		 * Data toggles are already in sync: the MaskROM phase used
-		 * only CONTROL transfers, leaving the host-side BULK toggles
-		 * at DATA0; usbplug also initialises its bulk toggles to DATA0.
-		 */
-		u->desc.usb_type = RKUSB_MODE_LOADER;
+		/* 3 stable Loader appearances — open a fresh handle. */
+		{
+			struct rkdev_list list2 = {0};
+			rkusb_enumerate(&list2);
+			int opened = -ENODEV;
+			for (size_t i = 0; i < list2.count && opened != 0; ++i) {
+				const struct rkdev_desc *d = &list2.devs[i];
+				if (d->usb_type != RKUSB_MODE_LOADER)
+					continue;
+				fprintf(stderr,
+				        "  [open] VID=0x%04X PID=0x%04X"
+				        " bcdUSB=0x%04X\n",
+				        d->vid, d->pid, d->bcdUSB);
+				opened = rkusb_open(u, d);
+				if (opened < 0)
+					fprintf(stderr,
+					        "  [open] failed: %s (%d)\n",
+					        libusb_error_name(opened),
+					        opened);
+			}
+			rkusb_free_list(&list2);
+			if (opened != 0) {
+				fprintf(stderr,
+				        "Loader vanished before open — retrying.\n");
+				consec = 0;
+				continue;
+			}
+		}
+
 		fprintf(stderr,
 		        "Loader mode ready "
 		        "(VID=0x%04X PID=0x%04X ep_in=0x%02X ep_out=0x%02X iface=%d)\n",
