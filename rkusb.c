@@ -474,6 +474,19 @@ static const struct rkop_info OP_TABLE[] = {
 	[RKOP_READ_SPARE]       = {1, 10},
 	[RKOP_WRITE_SPARE]      = {0, 10},
 	[RKOP_ERASE_LBA]        = {0, 10},
+	/*
+	 * These opcodes are above RKOP_ERASE_LBA (0x25) and therefore
+	 * outside the dense part of the table.  They are listed here so
+	 * that init_cbw's fallback "data_len ? IN : OUT" heuristic is
+	 * never reached for them.  (The designated-initialiser syntax
+	 * zero-fills the gaps between 0x25 and these entries; those gaps
+	 * are never consulted because the fallback branch checks
+	 * OP_TABLE[opcode].cdb_len != 0 first.)
+	 */
+	[RKOP_ERASE_SECTORS]    = {0,  6},   /* 0x29 */
+	[RKOP_CHANGE_STORAGE]   = {0,  6},   /* 0x2b */
+	[RKOP_READ_VENDOR]      = {1,  6},   /* 0x56 */
+	[RKOP_WRITE_LOADER]     = {0,  6},   /* 0x57 OUT: host writes to device */
 };
 
 static void init_cbw(struct cbw *cbw, uint8_t opcode, uint32_t data_len)
