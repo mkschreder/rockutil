@@ -4,3 +4,7 @@
 
 # Compiled binary
 rockutil
+
+# Test build artefacts (fixtures, op-logs, emulator pid files)
+tests/build/
+usbmon.txt

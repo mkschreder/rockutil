@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-2.0-only
+ * Copyright (C) 2024 rockutil contributors
+ */
 /* Enable POSIX/XOPEN APIs (fseeko, ftello, off_t, strcasecmp). */
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
@@ -690,19 +693,16 @@ static int wait_for_loader_mode(struct rkusb *u)
 	 * via linux_scan_devices() and updated only by udev "add"/"remove"
 	 * hotplug events processed by the background thread.
 	 *
-	 * The RV1106 transitions from MaskROM to usbplug via an IN-PLACE
-	 * USB bus reset — no physical disconnect, same bus/device address.
-	 * The kernel re-reads the device and config descriptors (iMfr
-	 * changes from 0 to 1, bulk endpoints appear) but the udev event
-	 * type is "change"/"bind", which libusb silently ignores.  The
-	 * stale MaskROM cache entry stays in ctx->usb_devs PERMANENTLY;
-	 * libusb_get_device_descriptor() always returns iMfr=0 regardless
-	 * of how many times we poll or reinitialise the context.
+	 * The RV1106 physically disconnects from USB after usbplug starts.
+	 * The device gets a new address (new session_id), so a udev "add"
+	 * event is generated.  However, the libusb udev background thread
+	 * sometimes fails to process that event in time — the reconnected
+	 * device never appears in ctx->usb_devs.
 	 *
-	 * A libusb reinit does help for SoCs that DO physically disconnect
-	 * (new device address → new session_id → fresh cache entry on the
-	 * initial linux_scan_devices() call if usbplug is already up).
-	 * Keep it for those devices.
+	 * A fresh libusb_init() always calls linux_scan_devices() which
+	 * reads current sysfs state directly, guaranteed to see the new
+	 * device if usbplug is already enumerated.  Reinitialise once per
+	 * second after the disconnect so we never miss the reconnect window.
 	 */
 	rkusb_library_exit();
 	if (rkusb_library_init() < 0) {
@@ -713,10 +713,11 @@ static int wait_for_loader_mode(struct rkusb *u)
 	/*
 	 * Step 3: poll for up to 120 s (2400 × 50 ms).
 	 *
-	 * The RV1106 usbplug firmware physically disconnects from USB at
-	 * ~T+5 s (after the MaskROM loader upload completes) so it can
-	 * initialise DDR and NAND/eMMC flash.  The device then reconnects
-	 * ~25–35 s later in Loader mode with a fresh device address.
+	 * The RV1106 usbplug firmware physically disconnects from USB
+	 * roughly 444 ms after the last 0x472 blob is ACKed (usbmon
+	 * capture: hub interrupt fires at that offset).  The device then
+	 * re-enumerates with a new address ~1-2 s later once usbplug has
+	 * initialised DDR and the NAND/eMMC flash controller.
 	 *
 	 * Two detection paths run in parallel every poll iteration:
 	 *
