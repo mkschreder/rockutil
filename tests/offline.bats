@@ -1,6 +1,4 @@
 #!/usr/bin/env bats
-# SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2024 rockutil contributors
 # offline.bats — tests that require no USB device and no root privileges.
 #
 # Environment:
@@ -116,14 +114,15 @@ FIXTURE_DIR="${FIXTURE_DIR:-tests/build/fixtures}"
 # GPT — offline path (no device → fallback size warning)
 # ---------------------------------------------------------------------------
 
-@test "GPT builds a 17408-byte file when no device is present" {
+@test "GPT builds a 34304-byte file (primary+backup) when no device is present" {
     local out="$BATS_TEST_TMPDIR/gpt_out.bin"
     run "$TOOL" GPT "$FIXTURE_DIR/parameter.txt" "$out"
     # Exit 0 even when no device: the tool falls back to 4 GiB default
     [ "$status" -eq 0 ]
     local size
     size=$(stat -c '%s' "$out")
-    [ "$size" -eq 17408 ]
+    # (34 primary + 33 backup) * 512 = 34304
+    [ "$size" -eq 34304 ]
 }
 
 @test "GPT output starts with protective MBR magic at byte 510" {
@@ -225,4 +224,210 @@ FIXTURE_DIR="${FIXTURE_DIR:-tests/build/fixtures}"
     run "$TOOL" SS badtype
     [ "$status" -eq 1 ]
     [[ "$output" =~ "Unknown storage" ]]
+}
+
+# ---------------------------------------------------------------------------
+# GPT full output — primary and backup regions
+# ---------------------------------------------------------------------------
+
+@test "GPT backup area has EFI PART signature at the correct offset" {
+    local out="$BATS_TEST_TMPDIR/gpt_full.bin"
+    run "$TOOL" GPT "$FIXTURE_DIR/parameter.txt" "$out"
+    [ "$status" -eq 0 ]
+    # Backup GPT header is the last sector of the blob:
+    #   offset = (34 + 33 - 1) * 512 = 66 * 512 = 33792
+    local sig
+    sig=$(dd if="$out" bs=1 skip=33792 count=8 2>/dev/null | cat)
+    [ "$sig" = "EFI PART" ]
+}
+
+@test "GPT primary and backup both contain EFI PART magic" {
+    local out="$BATS_TEST_TMPDIR/gpt_both.bin"
+    run "$TOOL" GPT "$FIXTURE_DIR/parameter.txt" "$out"
+    [ "$status" -eq 0 ]
+    # Primary header at byte 512
+    local primary_sig
+    primary_sig=$(dd if="$out" bs=1 skip=512 count=8 2>/dev/null | cat)
+    [ "$primary_sig" = "EFI PART" ]
+    # Backup header at byte 33792
+    local backup_sig
+    backup_sig=$(dd if="$out" bs=1 skip=33792 count=8 2>/dev/null | cat)
+    [ "$backup_sig" = "EFI PART" ]
+}
+
+# ---------------------------------------------------------------------------
+# PACK — build RKBOOT container from raw blobs
+# ---------------------------------------------------------------------------
+
+@test "PACK produces a file with BOOT magic" {
+    local out="$BATS_TEST_TMPDIR/packed.bin"
+    run "$TOOL" PACK 0x33353061 \
+        "$FIXTURE_DIR/loader.bin" \
+        "$FIXTURE_DIR/loader.bin" \
+        "$FIXTURE_DIR/loader.bin" \
+        "$out"
+    [ "$status" -eq 0 ]
+    [ -f "$out" ]
+    local magic
+    magic=$(dd if="$out" bs=1 count=4 2>/dev/null | cat)
+    [ "$magic" = "BOOT" ]
+}
+
+@test "PACK output can be parsed by PRINT" {
+    local ddr="$BATS_TEST_TMPDIR/ddr.bin"
+    local usb="$BATS_TEST_TMPDIR/usb.bin"
+    local ldr="$BATS_TEST_TMPDIR/ldr.bin"
+    printf '\xaa\xaa\xaa\xaa\xaa\xaa\xaa\xaa' > "$ddr"
+    printf '\xbb\xbb\xbb\xbb\xbb\xbb\xbb\xbb' > "$usb"
+    printf '\xcc\xcc\xcc\xcc\xcc\xcc\xcc\xcc' > "$ldr"
+    local out="$BATS_TEST_TMPDIR/pack_out.bin"
+    run "$TOOL" PACK 0x33353061 "$ddr" "$usb" "$ldr" "$out"
+    [ "$status" -eq 0 ]
+    run "$TOOL" PRINT "$out"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "RKBOOT header" ]]
+    [[ "$output" =~ "entries 471    : 1" ]]
+    [[ "$output" =~ "entries 472    : 1" ]]
+    [[ "$output" =~ "entries loader : 1" ]]
+}
+
+@test "PACK with missing input file exits 1" {
+    run "$TOOL" PACK 0x33353061 \
+        /nonexistent/ddr.bin \
+        "$FIXTURE_DIR/loader.bin" \
+        "$FIXTURE_DIR/loader.bin" \
+        "$BATS_TEST_TMPDIR/out.bin"
+    [ "$status" -eq 1 ]
+}
+
+@test "PACK with too few arguments exits 1" {
+    run "$TOOL" PACK
+    [ "$status" -eq 1 ]
+}
+
+# ---------------------------------------------------------------------------
+# UNPACK — extract RKBOOT entries to files
+# ---------------------------------------------------------------------------
+
+@test "UNPACK extracts 3 entry files from loader.bin" {
+    local outdir="$BATS_TEST_TMPDIR/unpack_out"
+    mkdir -p "$outdir"
+    run "$TOOL" UNPACK "$FIXTURE_DIR/loader.bin" "$outdir"
+    [ "$status" -eq 0 ]
+    # Should produce 471, 472, and loader files
+    local count
+    count=$(ls "$outdir"/*.bin 2>/dev/null | wc -l)
+    [ "$count" -ge 3 ]
+}
+
+@test "UNPACK 471 entry has correct content (0xAA bytes)" {
+    local outdir="$BATS_TEST_TMPDIR/unpack_aa"
+    mkdir -p "$outdir"
+    run "$TOOL" UNPACK "$FIXTURE_DIR/loader.bin" "$outdir"
+    [ "$status" -eq 0 ]
+    local f471
+    f471=$(ls "$outdir"/471_*.bin 2>/dev/null | head -1)
+    [ -n "$f471" ]
+    local first
+    first=$(od -An -tx1 -N1 "$f471" | tr -d ' ')
+    [ "$first" = "aa" ]
+}
+
+@test "UNPACK on non-RKBOOT file exits 1" {
+    run "$TOOL" UNPACK "$FIXTURE_DIR/random_4k.bin" "$BATS_TEST_TMPDIR"
+    [ "$status" -eq 1 ]
+}
+
+@test "UNPACK with too few arguments exits 1" {
+    run "$TOOL" UNPACK
+    [ "$status" -eq 1 ]
+}
+
+# ---------------------------------------------------------------------------
+# TAGSPL — prepend 4-byte chip tag to SPL binary
+# ---------------------------------------------------------------------------
+
+@test "TAGSPL output starts with the 4-byte chip tag" {
+    local out="$BATS_TEST_TMPDIR/tagged_spl.bin"
+    run "$TOOL" TAGSPL 0x33353061 "$FIXTURE_DIR/spl.bin" "$out"
+    [ "$status" -eq 0 ]
+    [ -f "$out" ]
+    # Chip tag 0x33353061 stored LE: 61 30 35 33
+    local b0 b1 b2 b3
+    b0=$(od -An -tx1 -j0 -N1 "$out" | tr -d ' ')
+    b1=$(od -An -tx1 -j1 -N1 "$out" | tr -d ' ')
+    b2=$(od -An -tx1 -j2 -N1 "$out" | tr -d ' ')
+    b3=$(od -An -tx1 -j3 -N1 "$out" | tr -d ' ')
+    [ "$b0" = "61" ]
+    [ "$b1" = "30" ]
+    [ "$b2" = "35" ]
+    [ "$b3" = "33" ]
+}
+
+@test "TAGSPL output is 4 bytes longer than the input SPL" {
+    local out="$BATS_TEST_TMPDIR/tagged_len.bin"
+    run "$TOOL" TAGSPL 0x33353061 "$FIXTURE_DIR/spl.bin" "$out"
+    [ "$status" -eq 0 ]
+    local in_size out_size
+    in_size=$(stat -c '%s' "$FIXTURE_DIR/spl.bin")
+    out_size=$(stat -c '%s' "$out")
+    [ "$out_size" -eq $(( in_size + 4 )) ]
+}
+
+@test "TAGSPL content after tag matches original SPL" {
+    local out="$BATS_TEST_TMPDIR/tagged_content.bin"
+    run "$TOOL" TAGSPL 0x33353061 "$FIXTURE_DIR/spl.bin" "$out"
+    [ "$status" -eq 0 ]
+    local in_size
+    in_size=$(stat -c '%s' "$FIXTURE_DIR/spl.bin")
+    # Strip the 4-byte tag and compare to original
+    local stripped="$BATS_TEST_TMPDIR/stripped.bin"
+    dd if="$out" bs=1 skip=4 of="$stripped" 2>/dev/null
+    cmp "$FIXTURE_DIR/spl.bin" "$stripped"
+}
+
+@test "TAGSPL with too few arguments exits 1" {
+    run "$TOOL" TAGSPL
+    [ "$status" -eq 1 ]
+}
+
+# ---------------------------------------------------------------------------
+# New negative cases
+# ---------------------------------------------------------------------------
+
+@test "WLX with too few arguments exits 1" {
+    run "$TOOL" WLX
+    [ "$status" -eq 1 ]
+}
+
+@test "WGPT with no arguments exits 1" {
+    run "$TOOL" WGPT
+    [ "$status" -eq 1 ]
+}
+
+@test "DUMP with too few arguments exits 1" {
+    run "$TOOL" DUMP
+    [ "$status" -eq 1 ]
+}
+
+@test "WRITE with too few arguments exits 1" {
+    run "$TOOL" WRITE
+    [ "$status" -eq 1 ]
+}
+
+@test "EXEC with no arguments exits 1" {
+    run "$TOOL" EXEC
+    [ "$status" -eq 1 ]
+}
+
+@test "OTP with no arguments exits 1" {
+    run "$TOOL" OTP
+    [ "$status" -eq 1 ]
+}
+
+@test "STORAGE no-arg lists storage types without error" {
+    run "$TOOL" STORAGE
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "emmc" ]]
+    [[ "$output" =~ "nand" ]]
 }

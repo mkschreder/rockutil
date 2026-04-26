@@ -261,6 +261,34 @@ PYEOF
 }
 
 # =========================================================================
+# Loader-mode commands must refuse to run against a MaskROM device
+# =========================================================================
+
+@test "RID on MaskROM device exits 1 with MaskROM mode message" {
+    run run_tool RID
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "MaskROM" ]]
+}
+
+@test "RFI on MaskROM device exits 1 with MaskROM mode message" {
+    run run_tool RFI
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "MaskROM" ]]
+}
+
+@test "TD on MaskROM device exits 1 with MaskROM mode message" {
+    run run_tool TD
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "MaskROM" ]]
+}
+
+@test "SS on MaskROM device exits 1 with MaskROM mode message" {
+    run run_tool SS nand
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "MaskROM" ]]
+}
+
+# =========================================================================
 # Negative MaskROM tests
 # =========================================================================
 
