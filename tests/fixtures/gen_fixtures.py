@@ -1,5 +1,3 @@
-# SPDX-License-Identifier: GPL-2.0-only
-# Copyright (C) 2024 rockutil contributors
 #!/usr/bin/env python3
 """
 gen_fixtures.py  <output_dir>
@@ -425,6 +423,62 @@ def main(out_dir: str) -> None:
     with open(param_path, "w") as f:
         f.write(PARAMETER_TXT)
     print("  parameter.txt written")
+
+    # -----------------------------------------------------------------------
+    # spl.bin — 512 random bytes representing a U-Boot SPL payload
+    # -----------------------------------------------------------------------
+    spl_data = rand_bytes(512)
+    with open(os.path.join(out_dir, "spl.bin"), "wb") as f:
+        f.write(spl_data)
+    print(f"  spl.bin: {len(spl_data)} bytes")
+
+    # -----------------------------------------------------------------------
+    # ubi_4k.img — 4096-byte UBI image starting with UBI magic
+    # The C code checks the LE u32 at offset 0 == 0x23494255 ("UBI#").
+    # Stored LE: bytes 0x55, 0x42, 0x49, 0x23.
+    # -----------------------------------------------------------------------
+    ubi_magic = struct.pack("<I", 0x23494255)  # 'U','B','I','#' as LE u32
+    ubi_data = ubi_magic + b"\x00" * (4096 - len(ubi_magic))
+    with open(os.path.join(out_dir, "ubi_4k.img"), "wb") as f:
+        f.write(ubi_data)
+    print(f"  ubi_4k.img: {len(ubi_data)} bytes (magic: {ubi_magic.hex()})")
+
+    # -----------------------------------------------------------------------
+    # sparse_4k.img — minimal Android sparse image
+    # Sparse file header (28 bytes):
+    #   magic=0xED26FF3A  major=1  minor=0  file_hdr_sz=28
+    #   chunk_hdr_sz=12  blk_sz=512  total_blks=8  total_chunks=1  crc32=0
+    # Chunk header (12 bytes):
+    #   type=CHUNK_TYPE_RAW=0xCAC1  reserved=0  chunk_sz=8  total_sz=12+4096
+    # Raw data: 8 × 512 = 4096 bytes
+    # -----------------------------------------------------------------------
+    SPARSE_MAGIC      = 0xED26FF3A
+    CHUNK_TYPE_RAW    = 0xCAC1
+    blk_sz            = 512
+    chunk_blks        = 8
+    raw_data          = b"\xAB" * (chunk_blks * blk_sz)
+    chunk_total_sz    = 12 + len(raw_data)
+
+    file_hdr  = struct.pack("<IHHHHIIIi",
+                            SPARSE_MAGIC,
+                            1, 0,      # major, minor
+                            28,        # file_hdr_sz
+                            12,        # chunk_hdr_sz
+                            blk_sz,
+                            chunk_blks,  # total_blks
+                            1,           # total_chunks
+                            0)           # image_checksum
+    chunk_hdr = struct.pack("<HHII",
+                            CHUNK_TYPE_RAW,
+                            0,           # reserved
+                            chunk_blks,  # chunk_sz (blocks)
+                            chunk_total_sz)
+
+    sparse_data = file_hdr + chunk_hdr + raw_data
+    with open(os.path.join(out_dir, "sparse_4k.img"), "wb") as f:
+        f.write(sparse_data)
+    print(f"  sparse_4k.img: {len(sparse_data)} bytes "
+          f"(header={len(file_hdr)}B + 1 chunk of {len(raw_data)}B raw)")
 
     print(f"\nFixtures written to {out_dir}")
 

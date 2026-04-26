@@ -62,17 +62,23 @@ CSW_SIGNATURE = 0x53425355  # "USBS"
 CSW_OK   = 0
 CSW_FAIL = 1
 
-RKOP_TEST_UNIT_READY = 0x00
-RKOP_READ_FLASH_ID   = 0x01
-RKOP_READ_LBA        = 0x14
-RKOP_WRITE_LBA       = 0x15
-RKOP_READ_FLASH_INFO = 0x1A
-RKOP_READ_CHIP_INFO  = 0x1B
-RKOP_ERASE_LBA       = 0x25
-RKOP_CHANGE_STORAGE  = 0x2B
-RKOP_READ_CAPABILITY = 0xAA
-RKOP_DEVICE_RESET    = 0xFF
-RKOP_WRITE_LOADER    = 0x57
+RKOP_TEST_UNIT_READY  = 0x00
+RKOP_READ_FLASH_ID    = 0x01
+RKOP_READ_LBA         = 0x14
+RKOP_WRITE_LBA        = 0x15
+RKOP_READ_FLASH_INFO  = 0x1A
+RKOP_READ_CHIP_INFO   = 0x1B
+RKOP_READ_SDRAM       = 0x17
+RKOP_WRITE_SDRAM      = 0x18
+RKOP_EXECUTE_SDRAM    = 0x19
+RKOP_ERASE_LBA        = 0x25
+RKOP_VS_READ          = 0x26
+RKOP_VS_WRITE         = 0x27
+RKOP_CHANGE_STORAGE   = 0x2B
+RKOP_OTP_READ         = 0x2C
+RKOP_READ_CAPABILITY  = 0xAA
+RKOP_DEVICE_RESET     = 0xFF
+RKOP_WRITE_LOADER     = 0x57
 
 SECTOR_SIZE   = 512
 FLASH_SECTORS = 131072  # 64 MiB
@@ -191,6 +197,18 @@ class SocketRockusbEmulator:
         # In-memory flash (64 MiB)
         self.flash = bytearray(FLASH_SECTORS * SECTOR_SIZE)
         self._seed_flash()
+
+        # Sparse SDRAM region: addr (int) -> bytes
+        self.sdram: dict[int, bytearray] = {}
+
+        # Vendor storage: index (int) -> bytes
+        # Index 1 = serial number (pre-seeded with a canned value)
+        self.vendor_storage: dict[int, bytes] = {
+            1: b"EMU_SERIAL_0001",
+        }
+
+        # OTP / eFuse: 16 bytes, canned pattern 0x00..0x0f
+        self.otp_data: bytes = bytes(range(16))
 
         # Handle tracking
         self.handles: dict[int, HandleState] = {}
@@ -613,6 +631,65 @@ class SocketRockusbEmulator:
             hs.write_op = op
             return None  # DATA_OUT phase
 
+        # ------------------------------------------------------------------
+        # SDRAM read / write / execute
+        # ------------------------------------------------------------------
+        if op == RKOP_READ_SDRAM:
+            # CDB: [2..5] addr BE, [7..8] len BE
+            addr = struct.unpack_from(">I", cdb, 2)[0] if len(cdb) >= 6 else 0
+            length = struct.unpack_from(">H", cdb, 7)[0] if len(cdb) >= 9 else cbw["data_length"]
+            self.oplog.write({"op": "READ_SDRAM", "addr": addr, "len": length})
+            # Return seeded pattern: byte = (addr + offset) & 0xFF
+            data_out = bytes((addr + i) & 0xFF for i in range(length))
+            return data_out, CSW_OK
+
+        if op == RKOP_WRITE_SDRAM:
+            addr = struct.unpack_from(">I", cdb, 2)[0] if len(cdb) >= 6 else 0
+            self.oplog.write({"op": "WRITE_SDRAM", "addr": addr,
+                              "len": cbw["data_length"]})
+            hs.write_lba = addr   # reuse write_lba field to hold SDRAM addr
+            hs.write_op  = op
+            return None  # DATA_OUT phase
+
+        if op == RKOP_EXECUTE_SDRAM:
+            addr = struct.unpack_from(">I", cdb, 2)[0] if len(cdb) >= 6 else 0
+            self.oplog.write({"op": "EXECUTE_SDRAM", "addr": addr})
+            return b"", CSW_OK
+
+        # ------------------------------------------------------------------
+        # Vendor storage read / write
+        # ------------------------------------------------------------------
+        if op == RKOP_VS_READ:
+            # CDB: [1..2] index LE, [3..4] len LE
+            idx = struct.unpack_from("<H", cdb, 1)[0] if len(cdb) >= 3 else 0
+            length = struct.unpack_from("<H", cdb, 3)[0] if len(cdb) >= 5 else cbw["data_length"]
+            self.oplog.write({"op": "VS_READ", "index": idx, "len": length})
+            raw = self.vendor_storage.get(idx, b"")
+            # Pad or truncate to requested length
+            if len(raw) < length:
+                raw = raw + b'\x00' * (length - len(raw))
+            return raw[:length], CSW_OK
+
+        if op == RKOP_VS_WRITE:
+            idx = struct.unpack_from("<H", cdb, 1)[0] if len(cdb) >= 3 else 0
+            self.oplog.write({"op": "VS_WRITE", "index": idx,
+                              "len": cbw["data_length"]})
+            hs.write_lba = idx   # reuse write_lba to hold VS index
+            hs.write_op  = op
+            return None  # DATA_OUT phase
+
+        # ------------------------------------------------------------------
+        # OTP read
+        # ------------------------------------------------------------------
+        if op == RKOP_OTP_READ:
+            # CDB: [2..3] len BE
+            length = struct.unpack_from(">H", cdb, 2)[0] if len(cdb) >= 4 else cbw["data_length"]
+            self.oplog.write({"op": "OTP_READ", "len": length})
+            raw = self.otp_data
+            if len(raw) < length:
+                raw = raw + b'\x00' * (length - len(raw))
+            return raw[:length], CSW_OK
+
         log.warning("Unknown opcode 0x%02X", op)
         self.oplog.write({"op": "UNKNOWN_CMD", "opcode": op})
         return b"", CSW_FAIL
@@ -622,6 +699,14 @@ class SocketRockusbEmulator:
         op = hs.write_op
         if op == RKOP_WRITE_LBA:
             self._flash_write(hs.write_lba, data)
+        elif op == RKOP_WRITE_SDRAM:
+            addr = hs.write_lba  # was stored in write_lba
+            self.sdram[addr] = bytearray(data)
+            log.debug("WRITE_SDRAM addr=0x%x len=%d", addr, len(data))
+        elif op == RKOP_VS_WRITE:
+            idx = hs.write_lba   # was stored in write_lba
+            self.vendor_storage[idx] = bytes(data)
+            log.debug("VS_WRITE index=%d len=%d", idx, len(data))
         # WRITE_LOADER data is accepted and discarded
         hs.csw_status = CSW_OK
 

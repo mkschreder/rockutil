@@ -71,6 +71,16 @@ struct libusb_device_handle {
 static int                   g_sock = -1;
 static struct libusb_context g_ctx_singleton;
 
+/*
+ * Fault-injection support.
+ *
+ * ROCKUTIL_EMU_CBW_IO_ERRORS=N makes the first N BULK_OUT calls on the
+ * ep_out endpoint (0x01) return LIBUSB_ERROR_IO before forwarding to the
+ * emulator.  Set by test cases that verify the cbw_exec retry loop.
+ */
+static int g_cbw_io_errors = -1; /* -1 = not yet initialised */
+static int g_cbw_io_remaining = 0;
+
 /* Device pool — allocated lazily per libusb_get_device_list call */
 #define MAX_EMU_DEVICES 8
 static struct libusb_device g_devpool[MAX_EMU_DEVICES];
@@ -642,6 +652,26 @@ int libusb_bulk_transfer(libusb_device_handle *handle, unsigned char endpoint,
 		return LIBUSB_SUCCESS;
 	} else {
 		/* Bulk OUT: send data to emulator */
+
+		/*
+		 * Fault injection: if ROCKUTIL_EMU_CBW_IO_ERRORS is set and
+		 * this is the ep_out (0x01) endpoint, return IO error for the
+		 * first N calls to exercise the cbw_exec retry loop.
+		 */
+		if (endpoint == 0x01) {
+			if (g_cbw_io_errors < 0) {
+				const char *ev = getenv("ROCKUTIL_EMU_CBW_IO_ERRORS");
+				g_cbw_io_errors = ev ? atoi(ev) : 0;
+				g_cbw_io_remaining = g_cbw_io_errors;
+			}
+			if (g_cbw_io_remaining > 0) {
+				--g_cbw_io_remaining;
+				if (transferred)
+					*transferred = 0;
+				return LIBUSB_ERROR_IO;
+			}
+		}
+
 		uint32_t plen = 6 + (uint32_t)length;
 		uint8_t *buf = malloc(plen);
 		if (!buf)
