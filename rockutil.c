@@ -821,9 +821,11 @@ static int wait_for_loader_mode(struct rkusb *u)
 		}
 
 		/*
-		 * Path B: live-descriptor probe for MASKROM-classified devices.
-		 * This handles the in-place re-enumeration case where the device
-		 * transitioned to usbplug but libusb's cache still shows MaskROM.
+		 * Path B: sysfs-descriptor probe for MASKROM-classified devices.
+		 * Reads /sys/bus/usb/devices/BUS-PATH/descriptors — no USB fd
+		 * open, no USB traffic.  Detects in-place re-enumeration where
+		 * the device transitions to usbplug without physically
+		 * disconnecting (libusb's cache remains stale indefinitely).
 		 */
 		if (found_maskrom) {
 			maskrom_copy.dev = maskrom_dev;
@@ -833,14 +835,22 @@ static int wait_for_loader_mode(struct rkusb *u)
 
 			if (opened == 0) {
 				fprintf(stderr,
-				        "Loader mode ready via live probe "
+				        "Loader mode ready via sysfs probe "
 				        "(VID=0x%04X PID=0x%04X"
 				        " ep_in=0x%02X ep_out=0x%02X iface=%d)\n",
 				        u->desc.vid, u->desc.pid,
 				        u->ep_in, u->ep_out, u->interface);
 				return 0;
 			}
-			/* -ENODEV = still MaskROM, other = transient error */
+			/*
+			 * -ENODEV  = still MaskROM or sysfs unavailable → keep polling
+			 * other    = transient open/claim error → log and keep polling
+			 */
+			if (opened != -ENODEV && tries % 20 == 0)
+				fprintf(stderr,
+				        "  [sysfs probe T+%.1fs] %s — retrying\n",
+				        (tries + 1) * 0.05,
+				        libusb_error_name(opened));
 		}
 	}
 	fprintf(stderr, "Timed out waiting for Loader mode.\n");
