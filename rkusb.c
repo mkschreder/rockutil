@@ -229,11 +229,13 @@ int rkusb_enumerate(struct rkdev_list *out)
 
 		struct rkdev_desc *r = &out->devs[out->count++];
 		memset(r, 0, sizeof(*r));
-		r->dev    = libusb_ref_device(dev);
-		r->vid    = d.idVendor;
-		r->pid    = d.idProduct;
-		r->bcdUSB = d.bcdUSB;
-		r->device_type = entry ? entry->device_type : RKDEV_NONE;
+		r->dev           = libusb_ref_device(dev);
+		r->vid           = d.idVendor;
+		r->pid           = d.idProduct;
+		r->bcdUSB        = d.bcdUSB;
+		r->iManufacturer = d.iManufacturer;
+		r->iProduct      = d.iProduct;
+		r->device_type   = entry ? entry->device_type : RKDEV_NONE;
 
 		/*
 		 * Mode classification — step 1: PID table / interface detection.

@@ -168,6 +168,8 @@ struct rkdev_desc {
 	uint16_t              bcdUSB;          /* USB spec number; bit 0=1 → Loader */
 	uint16_t              device_type;     /* rkdevice_type           */
 	uint16_t              usb_type;        /* rkusb_mode              */
+	uint8_t               iManufacturer;   /* USB string descriptor index */
+	uint8_t               iProduct;        /* USB string descriptor index */
 	uint8_t               bus;
 	uint8_t               port_path[7];
 	int                   port_path_len;
