@@ -677,44 +677,66 @@ static int maskrom_handshake(struct rkusb *u, const struct rkboot *boot)
 static int wait_for_loader_mode(struct rkusb *u)
 {
 	/*
-	 * Drop the MaskROM handle so libusb_get_device_list no longer
-	 * returns the stale reference for the old device address.
+	 * Step 1: drop the MaskROM handle.
+	 *
+	 * The handle must be closed before polling so libusb_get_device_list
+	 * does not trip over the open fd on a device that is about to
+	 * disappear.
 	 */
 	rkusb_close(u);
 
 	/*
-	 * Poll for up to 30 s (600 × 50 ms).  As soon as a LOADER-mode
-	 * device appears, attempt to open it immediately — no stability
-	 * count is required.  The old 3-consecutive-poll rule was the
-	 * primary failure cause: usbplug performs several USB resets
-	 * during flash initialisation, each of which disconnects and
-	 * reconnects the device.  Every disconnect reset the counter to
-	 * zero, so 3 back-to-back stable polls were never accumulated
-	 * within the old 6 s window.
+	 * Step 2: reinitialise the libusb context.
 	 *
-	 * If the open attempt fails (device still initialising), we log
-	 * the error and continue polling.  State changes (new device,
-	 * disappearance, mode change) are printed so that future issues
-	 * are self-diagnosing.
+	 * On Linux, libusb with udev hotplug support does NOT do a fresh
+	 * udev scan on every libusb_get_device_list() call.  Instead it
+	 * returns whatever is in the context's internal device cache
+	 * (ctx->usb_devs), which was populated once at libusb_init() time
+	 * via linux_scan_devices() and is updated incrementally by the
+	 * background hotplug event thread.
+	 *
+	 * The RV1106 MaskROM and its usbplug replacement sometimes
+	 * re-enumerate at the SAME USB bus/device address (same
+	 * session_id = busnum<<8|devaddr).  When this happens,
+	 * linux_enumerate_device() finds the stale MaskROM entry in the
+	 * cache (iManufacturer=0) and returns it unchanged, so the
+	 * string-descriptor tiebreaker never fires and usbplug is
+	 * eternally misclassified as MASKROM.
+	 *
+	 * Calling libusb_exit() + libusb_init() forces a fresh
+	 * linux_scan_devices() scan, equivalent to what the second run of
+	 * the program does.  This guarantees that the cache reflects the
+	 * current USB state with correct descriptors.
+	 *
+	 * Cost: ~1 ms; completely safe because no transfers are in flight.
 	 */
+	rkusb_library_exit();
+	if (rkusb_library_init() < 0) {
+		fprintf(stderr, "libusb reinit failed — cannot poll for Loader.\n");
+		return -ENODEV;
+	}
 
 	/*
-	 * Seeing the device appear as Maskrom immediately after the upload
-	 * completes is normal: the MaskROM firmware is still running while
-	 * it validates and executes the uploaded usbplug blob.  The device
-	 * will disconnect ~2 s after the MaskROM first connected and then
-	 * re-enumerate as Loader once usbplug takes over.  Logging every
-	 * Maskrom poll would only confuse the user, so we suppress those
-	 * and only report noteworthy state transitions.
+	 * Step 3: poll for up to 30 s (600 × 50 ms).
+	 *
+	 * As soon as a LOADER-mode device appears attempt to open it
+	 * immediately.  If the open fails (device still initialising after
+	 * a re-enumeration) log the error and retry on the next poll.
+	 *
+	 * Verbose diagnostic lines (showing iManufacturer so the
+	 * tiebreaker logic can be audited) are emitted for every device
+	 * after 5 s of not finding the Loader — in normal operation the
+	 * device is detected well before that.
 	 */
 
-	/* sentinel: "haven't seen anything yet" */
 	uint16_t prev_vid  = 0;
 	uint16_t prev_pid  = 0;
 	uint16_t prev_type = 0xFFFF;
 
 	for (int tries = 0; tries < 600; ++tries) {
 		usleep(50 * 1000);
+
+		bool verbose = (tries >= 100); /* enable after 5 s */
 
 		struct rkdev_list list = {0};
 		rkusb_enumerate(&list);
@@ -727,25 +749,40 @@ static int wait_for_loader_mode(struct rkusb *u)
 			const struct rkdev_desc *d = &list.devs[i];
 
 			/*
-			 * Log only non-MASKROM state changes.  A MASKROM device
-			 * visible right after upload is expected (usbplug hasn't
-			 * executed yet); printing it confuses operators into
-			 * thinking the tool is broken and causes premature Ctrl+C.
-			 * Log Loader appearances, unexpected modes, and
-			 * transitions back to Maskrom after a Loader was seen.
+			 * In normal operation the device briefly appears as
+			 * Maskrom while the uploaded usbplug blob is executing
+			 * the DDR/flash init sequence, then re-enumerates as
+			 * Loader.  Printing every Maskrom poll only confuses
+			 * operators into thinking the tool is stuck.
+			 *
+			 * When verbose mode kicks in (after 5 s with no Loader
+			 * found), emit every device line together with the raw
+			 * iManufacturer/iProduct indices so the tiebreaker
+			 * decision can be audited.
 			 */
 			bool noteworthy =
+				verbose ||
 				d->usb_type != RKUSB_MODE_MASKROM ||
 				prev_type == RKUSB_MODE_LOADER;
 			if (noteworthy &&
 			    (d->vid != prev_vid || d->pid != prev_pid ||
-			     d->usb_type != prev_type)) {
-				fprintf(stderr,
-				        "  [T+%.1fs] VID=0x%04X PID=0x%04X"
-				        " mode=%s\n",
-				        (tries + 1) * 0.05,
-				        d->vid, d->pid,
-				        rkusb_mode_name(d->usb_type));
+			     d->usb_type != prev_type || verbose)) {
+				if (verbose)
+					fprintf(stderr,
+					        "  [T+%.1fs] VID=0x%04X PID=0x%04X"
+					        " mode=%s iMfr=%u iProd=%u\n",
+					        (tries + 1) * 0.05,
+					        d->vid, d->pid,
+					        rkusb_mode_name(d->usb_type),
+					        d->iManufacturer,
+					        d->iProduct);
+				else
+					fprintf(stderr,
+					        "  [T+%.1fs] VID=0x%04X PID=0x%04X"
+					        " mode=%s\n",
+					        (tries + 1) * 0.05,
+					        d->vid, d->pid,
+					        rkusb_mode_name(d->usb_type));
 			}
 			prev_vid  = d->vid;
 			prev_pid  = d->pid;
@@ -755,17 +792,12 @@ static int wait_for_loader_mode(struct rkusb *u)
 			    d->usb_type == RKUSB_MODE_LOADER) {
 				found_loader = true;
 				loader_copy  = *d;
-				/*
-				 * Hold an extra reference so the device object
-				 * remains valid after rkusb_free_list() decrements
-				 * the enumerate-time reference.
-				 */
-				loader_dev = libusb_ref_device(d->dev);
+				loader_dev   = libusb_ref_device(d->dev);
 			}
 		}
 
 		if (list.count == 0 && prev_type != 0xFFFF) {
-			if (prev_type != RKUSB_MODE_MASKROM)
+			if (verbose || prev_type != RKUSB_MODE_MASKROM)
 				fprintf(stderr,
 				        "  [T+%.1fs] no Rockchip devices visible\n",
 				        (tries + 1) * 0.05);
@@ -779,10 +811,9 @@ static int wait_for_loader_mode(struct rkusb *u)
 		if (!found_loader)
 			continue;
 
-		/* Try to open immediately — no stability wait. */
-		loader_copy.dev = loader_dev; /* still valid: extra ref held */
+		loader_copy.dev = loader_dev;
 		int opened = rkusb_open(u, &loader_copy);
-		libusb_unref_device(loader_dev); /* release our extra ref */
+		libusb_unref_device(loader_dev);
 
 		if (opened < 0) {
 			fprintf(stderr,
@@ -790,7 +821,6 @@ static int wait_for_loader_mode(struct rkusb *u)
 			        " — will retry\n",
 			        loader_copy.vid, loader_copy.pid,
 			        libusb_error_name(opened));
-			/* Force re-logging on next appearance. */
 			prev_type = 0xFFFF;
 			continue;
 		}
