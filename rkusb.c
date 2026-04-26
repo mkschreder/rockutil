@@ -418,7 +418,13 @@ static int sysfs_device_path(const struct rkdev_desc *desc,
 	if (desc->port_path_len <= 0)
 		return -1;
 
-	int pos = snprintf(buf, bufsz, "/sys/bus/usb/devices/%u", desc->bus);
+	/* Allow tests to redirect the sysfs tree to a temporary directory. */
+	const char *sysfs_root = getenv("ROCKUTIL_SYSFS_ROOT");
+	if (!sysfs_root)
+		sysfs_root = "";
+
+	int pos = snprintf(buf, bufsz, "%s/sys/bus/usb/devices/%u",
+	                   sysfs_root, desc->bus);
 	for (int i = 0; i < desc->port_path_len && pos < (int)bufsz - 1; ++i) {
 		pos += snprintf(buf + pos, bufsz - pos,
 		                "%s%u",
