@@ -289,6 +289,164 @@ void rkboot_print(const struct rkboot *b)
 }
 
 /* ------------------------------------------------------------------ */
+/* RKBOOT builder / extractor                                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Encode a UTF-8 string as a null-terminated UTF-16LE sequence into
+ * a fixed-size buffer of `word_count` uint16_t words (including the
+ * null terminator).  Characters outside the BMP are replaced with '?'.
+ */
+static void encode_utf16le(const char *src, uint16_t *dst, size_t word_count)
+{
+	size_t i = 0;
+	while (*src && i + 1 < word_count) {
+		uint8_t c = (uint8_t)*src++;
+		uint32_t cp;
+		if (c < 0x80) {
+			cp = c;
+		} else if ((c & 0xe0) == 0xc0 && *src) {
+			cp = (uint32_t)(c & 0x1f) << 6;
+			cp |= (uint8_t)*src++ & 0x3f;
+		} else if ((c & 0xf0) == 0xe0 && src[0] && src[1]) {
+			cp = (uint32_t)(c & 0x0f) << 12;
+			cp |= ((uint8_t)*src++ & 0x3f) << 6;
+			cp |= (uint8_t)*src++ & 0x3f;
+		} else {
+			cp = '?';
+		}
+		dst[i++] = (uint16_t)(cp > 0xffff ? '?' : cp);
+	}
+	if (i < word_count)
+		dst[i] = 0;
+}
+
+int rkboot_build(uint32_t chip, uint8_t rc4_disable,
+                 const uint8_t *e471, size_t e471_len,
+                 const uint8_t *e472, size_t e472_len,
+                 const uint8_t *loader, size_t loader_len,
+                 uint8_t **out, size_t *out_len)
+{
+	const uint8_t  hdr_size   = 46;    /* as stored by real Rockchip tool */
+	const uint8_t  entry_size = (uint8_t)sizeof(struct rkboot_entry_raw); /* 57 */
+
+	/* Compute table and data offsets ------------------------------------- */
+	const uint32_t e471_tbl_off    = hdr_size;
+	const uint32_t e472_tbl_off    = e471_tbl_off  + entry_size;
+	const uint32_t loader_tbl_off  = e472_tbl_off  + entry_size;
+	const uint32_t data_base       = loader_tbl_off + entry_size;
+	const uint32_t e471_data_off   = data_base;
+	const uint32_t e472_data_off   = e471_data_off + (uint32_t)e471_len;
+	const uint32_t loader_data_off = e472_data_off + (uint32_t)e472_len;
+
+	const size_t body_len = loader_data_off + loader_len;
+	const size_t total    = body_len + 4; /* +4 for trailing CRC */
+
+	uint8_t *blob = calloc(1, total);
+	if (!blob)
+		return -ENOMEM;
+
+	/* Write header ------------------------------------------------------- */
+	struct rkboot_header *hdr = (struct rkboot_header *)blob;
+	memcpy(hdr->magic, "BOOT", 4);
+	hdr->hdr_size      = hdr_size;
+	hdr->version       = 0x00010000;
+	hdr->merge_version = 0x00010000;
+	hdr->year          = 2024;
+	hdr->month         = 1;
+	hdr->day           = 1;
+	hdr->chip          = chip;
+	hdr->entry471_count  = 1;
+	hdr->entry471_offset = e471_tbl_off;
+	hdr->entry471_size   = entry_size;
+	hdr->entry472_count  = 1;
+	hdr->entry472_offset = e472_tbl_off;
+	hdr->entry472_size   = entry_size;
+	hdr->loader_count    = 1;
+	hdr->loader_offset   = loader_tbl_off;
+	hdr->loader_size     = entry_size;
+	hdr->rc4_disable     = rc4_disable;
+	/* sizeof(rkboot_header) == 45; hdr_size == 46, so byte 45 stays 0 */
+
+	/* Helper to fill an entry_raw record --------------------------------- */
+#define FILL_ENTRY(off, type_code, data_off, data_sz, name_str)              \
+	do {                                                                      \
+		struct rkboot_entry_raw *_e =                                         \
+			(struct rkboot_entry_raw *)(blob + (off));                        \
+		_e->size        = entry_size;                                         \
+		_e->type        = (type_code);                                        \
+		encode_utf16le((name_str), _e->name, 20);                             \
+		_e->data_offset = (data_off);                                         \
+		_e->data_size   = (uint32_t)(data_sz);                                \
+		_e->data_delay  = 0;                                                  \
+	} while (0)
+
+	FILL_ENTRY(e471_tbl_off,   0x01, e471_data_off,   e471_len,   "DDR");
+	FILL_ENTRY(e472_tbl_off,   0x02, e472_data_off,   e472_len,   "USB");
+	FILL_ENTRY(loader_tbl_off, 0x04, loader_data_off, loader_len, "LDR");
+#undef FILL_ENTRY
+
+	/* Copy payloads ------------------------------------------------------- */
+	memcpy(blob + e471_data_off,   e471,   e471_len);
+	memcpy(blob + e472_data_off,   e472,   e472_len);
+	memcpy(blob + loader_data_off, loader, loader_len);
+
+	/* Append trailing CRC32 (little-endian) ------------------------------ */
+	uint32_t crc = rkcrc_rkfw(blob, body_len);
+	blob[body_len + 0] = (uint8_t)(crc);
+	blob[body_len + 1] = (uint8_t)(crc >> 8);
+	blob[body_len + 2] = (uint8_t)(crc >> 16);
+	blob[body_len + 3] = (uint8_t)(crc >> 24);
+
+	*out     = blob;
+	*out_len = total;
+	return 0;
+}
+
+int rkboot_extract(const struct rkboot *b, const char *output_dir)
+{
+	struct {
+		const char            *prefix;
+		const struct rkboot_entry *entries;
+		size_t                 count;
+	} groups[3] = {
+		{ "471",    b->e471,   b->n471    },
+		{ "472",    b->e472,   b->n472    },
+		{ "loader", b->loader, b->nloader },
+	};
+
+	for (int g = 0; g < 3; ++g) {
+		for (size_t i = 0; i < groups[g].count; ++i) {
+			const struct rkboot_entry *e = &groups[g].entries[i];
+
+			uint8_t *payload = NULL;
+			size_t   payload_len = 0;
+			int rc = rkboot_copy_entry(b, e, &payload, &payload_len);
+			if (rc < 0)
+				return rc;
+
+			/* Build output path: <outdir>/<prefix>_<i>_<name>.bin */
+			char path[512];
+			snprintf(path, sizeof(path), "%s/%s_%zu_%s.bin",
+			         output_dir, groups[g].prefix, i, e->name);
+
+			FILE *fp = fopen(path, "wb");
+			if (!fp) {
+				int e_save = -errno;
+				free(payload);
+				return e_save;
+			}
+			size_t written = fwrite(payload, 1, payload_len, fp);
+			fclose(fp);
+			free(payload);
+			if (written != payload_len)
+				return -EIO;
+		}
+	}
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* RKFW                                                               */
 /* ------------------------------------------------------------------ */
 

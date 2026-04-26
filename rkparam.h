@@ -1,6 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0-only
- * Copyright (C) 2024 rockutil contributors
- */
 /*
  * rkparam.h - parser for Rockchip parameter.txt files and a tiny GPT
  *             builder that converts the partition table into a proper
@@ -27,6 +24,9 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* UBI image magic (big-endian: 'U','B','I','#' = 0x55424923) */
+#define RKUBI_MAGIC 0x23494255u
 
 #define RKPARAM_MAX_PARTS 64
 
@@ -63,6 +63,36 @@ int rk_parameter_load_buffer(struct rk_parameter *p, const void *buf,
 int rk_parameter_build_gpt(const struct rk_parameter *p,
                            uint64_t device_lba_count,
                            uint8_t **out, size_t *out_len);
+
+/*
+ * Build both primary and backup GPT regions.
+ * `*out` is malloc'd and contains two sections:
+ *   [0 .. 34*512)             - primary GPT area (protective MBR + header + entries)
+ *   [34*512 .. 34*512+33*512) - backup GPT area (entries + backup header)
+ * `*out_len` = (34 + 33) * 512 = 34304 bytes.
+ * Callers are responsible for writing the primary section to LBA 0
+ * and the backup section to LBA (device_lba_count - 33).
+ */
+int rk_parameter_build_gpt_full(const struct rk_parameter *p,
+                                uint64_t device_lba_count,
+                                uint8_t **out, size_t *out_len);
+
+/*
+ * Parse a GPT blob (e.g. read from LBA 0 on the device) and find the
+ * partition named `name`.  The name is compared case-sensitively.
+ * On success returns 0 and sets *first_lba_out / *last_lba_out.
+ * Returns -ENOENT if the partition is not found.
+ * `len` must be at least 34 * 512 bytes.
+ */
+int rk_gpt_find_part(const uint8_t *gpt_blob, size_t len,
+                     const char *name,
+                     uint64_t *first_lba_out, uint64_t *last_lba_out);
+
+/*
+ * Pretty-print the partition table from a GPT blob to stdout.
+ * Skips empty entries (zero type GUID).
+ */
+void rk_gpt_print(const uint8_t *gpt_blob, size_t len);
 
 #ifdef __cplusplus
 }

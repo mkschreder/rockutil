@@ -1,12 +1,9 @@
-/* SPDX-License-Identifier: GPL-2.0-only
- * Copyright (C) 2024 rockutil contributors
- */
 /*
  * rkimage.h - Rockchip firmware container parsers (RKFW / RKAF / RKBOOT).
  *
- * The on-disk formats are accepted by `rkdeveloptool`, `rkflashtool`,
- * and `mkkrnlimg` — Rockchip has kept them stable across
- * RK2918..RK35xx generations.
+ * Implements parsing of the standard Rockchip on-disk firmware container
+ * formats that have been kept stable across RK2918..RK35xx generations
+ * and are documented in Rockchip open-source SDK releases.
  *
  * Structure summary
  * -----------------
@@ -222,6 +219,33 @@ int  rkaf_copy_part(const struct rkaf *img, const struct rkaf_part *p,
 /* Locate a partition by its canonical name ("boot", "system", ...). */
 const struct rkaf_part *rkaf_find_part(const struct rkaf *img,
                                        const char *name);
+
+/*
+ * Build an RKBOOT container from three raw binary payloads and return
+ * a malloc'd blob suitable for writing to disk or uploading via UL.
+ *
+ * chip        : Rockchip SoC code stored in the header (e.g. 0x33353061).
+ * rc4_disable : set non-zero for modern SoCs that carry plain payloads.
+ * e471/e472   : DDR-init and USB-plug blobs sent via MaskROM wIndex 0x0471/0x0472.
+ * loader      : final bootloader payload.
+ *
+ * On success returns 0; *out is malloc'd and *out_len is the file size.
+ * Caller must free(*out).
+ */
+int rkboot_build(uint32_t chip, uint8_t rc4_disable,
+                 const uint8_t *e471, size_t e471_len,
+                 const uint8_t *e472, size_t e472_len,
+                 const uint8_t *loader, size_t loader_len,
+                 uint8_t **out, size_t *out_len);
+
+/*
+ * Extract all entry payloads from a parsed RKBOOT to individual files.
+ * Files are named: <output_dir>/471_<i>_<name>.bin  (DDR init)
+ *                  <output_dir>/472_<i>_<name>.bin  (USB plug)
+ *                  <output_dir>/loader_<i>_<name>.bin (loader)
+ * Returns 0 on success.
+ */
+int rkboot_extract(const struct rkboot *b, const char *output_dir);
 
 /* Pretty-print helpers (used by UF/DI commands). */
 void rkboot_print(const struct rkboot *b);

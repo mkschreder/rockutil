@@ -1,17 +1,15 @@
-/* SPDX-License-Identifier: GPL-2.0-only
- * Copyright (C) 2024 rockutil contributors
- */
 /*
  * rkusb.h - Rockchip Rockusb / Mass-Storage-over-BulkOnly protocol
  *
- * Implements the Rockchip Rockusb protocol over USB Mass Storage Class
- * Bulk-Only Transport (BoT), vendor class 0xFF / subclass 0x06 /
- * protocol 0x05, plus the MaskROM vendor control transfers used to
- * upload the first-stage bootloader.
+ * Implements the standard USB Mass Storage Class Bulk-Only Transport
+ * (BoT) with a vendor-specific class (0xFF / subclass 0x06 / protocol
+ * 0x05) plus the MaskROM vendor control transfer used to upload the
+ * first-stage bootloader.
  *
  * The CBW / CSW layout matches USB MSC BBB.  The CDB carries a
  * Rockchip-specific opcode in byte 0 followed by operation-specific
- * parameters in big-endian form.
+ * parameters in big-endian or little-endian form depending on the
+ * command.
  */
 #ifndef RKUSB_H
 #define RKUSB_H
@@ -107,7 +105,21 @@ enum rkusb_opcode {
 	RKOP_READ_SPARE      = 0x21,
 	RKOP_WRITE_SPARE     = 0x22,
 	RKOP_ERASE_LBA       = 0x25,
+	/*
+	 * Vendor storage read/write (opcodes 0x26/0x27).
+	 * CDB layout: [0]=opcode [1..2]=index(LE) [3..4]=len(LE)
+	 * The vendor storage area holds small named blobs (serial number,
+	 * calibration data, etc.) indexed by a 16-bit key.
+	 */
+	RKOP_VS_READ         = 0x26,
+	RKOP_VS_WRITE        = 0x27,
+	RKOP_ERASE_SECTORS   = 0x29,
 	RKOP_CHANGE_STORAGE  = 0x2b,
+	/*
+	 * OTP / eFuse read (opcode 0x2c).
+	 * CDB layout: [0]=opcode [2..3]=len(BE)
+	 */
+	RKOP_OTP_READ        = 0x2c,
 	RKOP_READ_CAPABILITY = 0xaa,
 	RKOP_DEVICE_RESET    = 0xff,
 
@@ -120,7 +132,6 @@ enum rkusb_opcode {
 	RKOP_READ_VENDOR     = 0x56,
 	RKOP_WRITE_LOADER    = 0x57,
 	RKOP_LOWER_FORMAT    = 0x1d,
-	RKOP_ERASE_SECTORS   = 0x29,
 };
 
 /* Sub-codes for RKOP_DEVICE_RESET */
@@ -248,9 +259,28 @@ int rkusb_write_lba(struct rkusb *u, uint32_t lba, uint16_t sectors,
                     const uint8_t *buf);
 int rkusb_erase_lba(struct rkusb *u, uint32_t lba, uint32_t sectors);
 
+int rkusb_read_sdram(struct rkusb *u, uint32_t addr, uint8_t *buf,
+                     uint32_t len);
 int rkusb_write_sdram(struct rkusb *u, uint32_t addr, const uint8_t *buf,
                       uint32_t len);
 int rkusb_execute_sdram(struct rkusb *u, uint32_t addr);
+
+/*
+ * Vendor storage read/write.
+ * `index` selects the vendor storage slot (0-based).
+ * Reads/writes up to `len` bytes.  The maximum transfer size per call
+ * is limited by RKUSB_MAX_CHUNK (4 KiB); callers must chunk larger
+ * payloads themselves.
+ */
+int rkusb_vs_read(struct rkusb *u, uint16_t index, uint8_t *buf, uint32_t len);
+int rkusb_vs_write(struct rkusb *u, uint16_t index, const uint8_t *buf,
+                   uint32_t len);
+
+/*
+ * OTP / one-time-programmable area dump.
+ * Reads `len` bytes from the OTP region into `buf`.
+ */
+int rkusb_otp_read(struct rkusb *u, uint8_t *buf, uint32_t len);
 
 /* Loader-mode specific commands */
 int rkusb_switch_storage(struct rkusb *u, uint8_t storage);

@@ -1,6 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0-only
- * Copyright (C) 2024 rockutil contributors
- */
 /*
  * rkparam.c - parameter.txt parser + GPT builder.
  */
@@ -375,4 +372,173 @@ int rk_parameter_build_gpt(const struct rk_parameter *p,
 	*out = blob;
 	*out_len = total_bytes;
 	return 0;
+}
+
+int rk_parameter_build_gpt_full(const struct rk_parameter *p,
+                                uint64_t device_lba_count,
+                                uint8_t **out, size_t *out_len)
+{
+	if (device_lba_count < 34 + 33)
+		return -EINVAL;
+
+	/* Build the primary GPT area first (34 sectors). */
+	uint8_t *primary = NULL;
+	size_t   primary_len = 0;
+	int rc = rk_parameter_build_gpt(p, device_lba_count, &primary,
+	                                &primary_len);
+	if (rc < 0)
+		return rc;
+
+	const size_t primary_sectors = 34;
+	const size_t backup_sectors  = 33;
+	const size_t total = (primary_sectors + backup_sectors) * 512;
+
+	uint8_t *blob = calloc(1, total);
+	if (!blob) {
+		free(primary);
+		return -ENOMEM;
+	}
+
+	/* Copy primary area into output blob. */
+	memcpy(blob, primary, primary_len);
+	free(primary);
+
+	/*
+	 * Backup GPT layout (33 sectors):
+	 *   LBA (dev-33) .. (dev-2) : backup partition entry array (32 sectors)
+	 *   LBA (dev-1)             : backup GPT header
+	 *
+	 * In the output blob:
+	 *   offset [34*512 .. 66*512)  = backup partition entries  (sectors 0-31)
+	 *   offset [66*512 .. 67*512)  = backup header             (sector 32)
+	 */
+	struct gpt_entry *primary_entries =
+		(struct gpt_entry *)(blob + 2 * 512);
+	uint8_t *backup_entries_start = blob + primary_sectors * 512;
+	struct gpt_entry *backup_entries =
+		(struct gpt_entry *)backup_entries_start;
+
+	/* Duplicate partition array into backup area. */
+	memcpy(backup_entries, primary_entries,
+	       128 * sizeof(struct gpt_entry));
+
+	/* Construct backup GPT header at the very end of the blob. */
+	struct gpt_header *primary_hdr = (struct gpt_header *)(blob + 512);
+	struct gpt_header *backup_hdr  =
+		(struct gpt_header *)(blob + (primary_sectors + backup_sectors - 1) * 512);
+
+	memcpy(backup_hdr->signature, "EFI PART", 8);
+	backup_hdr->revision        = 0x00010000;
+	backup_hdr->header_size     = 92;
+	backup_hdr->reserved        = 0;
+	/* Backup header lives at the last LBA; points back to primary. */
+	backup_hdr->current_lba     = device_lba_count - 1;
+	backup_hdr->backup_lba      = 1;
+	backup_hdr->first_usable_lba = primary_hdr->first_usable_lba;
+	backup_hdr->last_usable_lba  = primary_hdr->last_usable_lba;
+	memcpy(backup_hdr->disk_guid, primary_hdr->disk_guid, 16);
+	/* Backup partition entries start at LBA (dev-33) */
+	backup_hdr->part_entry_lba  = device_lba_count - 33;
+	backup_hdr->num_part_entries = 128;
+	backup_hdr->part_entry_size  = sizeof(struct gpt_entry);
+	backup_hdr->part_array_crc32 =
+		rkcrc32_le(0, backup_entries_start,
+		           128 * sizeof(struct gpt_entry));
+	backup_hdr->header_crc32 = 0;
+	backup_hdr->header_crc32 =
+		rkcrc32_le(0, (const uint8_t *)backup_hdr, 92);
+
+	*out     = blob;
+	*out_len = total;
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* GPT reader helpers                                                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Compare a UTF-16LE GPT partition name with a UTF-8 C string.
+ * Returns 1 if they match (case-sensitive ASCII).
+ */
+static int utf16le_match(const uint16_t *utf16, size_t max_words,
+                         const char *utf8)
+{
+	for (size_t i = 0; i < max_words; ++i) {
+		uint16_t wc = utf16[i];
+		uint8_t  c  = (uint8_t)utf8[i];
+		if (wc == 0 && c == '\0')
+			return 1;
+		if (wc == 0 || c == '\0')
+			return 0;
+		if ((uint8_t)(wc & 0xff) != c || (wc >> 8) != 0)
+			return 0;
+	}
+	return 0;
+}
+
+static int is_zero_guid(const uint8_t guid[16])
+{
+	for (int i = 0; i < 16; ++i)
+		if (guid[i])
+			return 0;
+	return 1;
+}
+
+int rk_gpt_find_part(const uint8_t *gpt_blob, size_t len,
+                     const char *name,
+                     uint64_t *first_lba_out, uint64_t *last_lba_out)
+{
+	if (len < 34 * 512)
+		return -EINVAL;
+
+	const struct gpt_entry *entries =
+		(const struct gpt_entry *)(gpt_blob + 2 * 512);
+
+	for (int i = 0; i < 128; ++i) {
+		const struct gpt_entry *e = &entries[i];
+		if (is_zero_guid(e->type_guid))
+			continue;
+		if (utf16le_match(e->name, 36, name)) {
+			if (first_lba_out)
+				*first_lba_out = e->first_lba;
+			if (last_lba_out)
+				*last_lba_out  = e->last_lba;
+			return 0;
+		}
+	}
+	return -ENOENT;
+}
+
+void rk_gpt_print(const uint8_t *gpt_blob, size_t len)
+{
+	if (len < 34 * 512)
+		return;
+
+	const struct gpt_entry *entries =
+		(const struct gpt_entry *)(gpt_blob + 2 * 512);
+
+	printf("%-20s  %10s  %10s  %10s\n",
+	       "Name", "Start LBA", "End LBA", "Size (MiB)");
+	printf("%-20s  %10s  %10s  %10s\n",
+	       "----", "---------", "-------", "----------");
+
+	for (int i = 0; i < 128; ++i) {
+		const struct gpt_entry *e = &entries[i];
+		if (is_zero_guid(e->type_guid))
+			continue;
+
+		/* Convert UTF-16LE name to ASCII for display. */
+		char name[37] = {0};
+		for (int j = 0; j < 36 && e->name[j]; ++j)
+			name[j] = (char)(e->name[j] & 0x7f);
+
+		uint64_t size_mib =
+			((e->last_lba - e->first_lba + 1) * 512) / (1024 * 1024);
+		printf("%-20s  %10llu  %10llu  %10llu\n",
+		       name,
+		       (unsigned long long)e->first_lba,
+		       (unsigned long long)e->last_lba,
+		       (unsigned long long)size_mib);
+	}
 }

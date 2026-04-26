@@ -26,7 +26,9 @@ static libusb_context *g_ctx;
 static bool            g_seeded;
 
 /*
- * Known Rockchip (vid, pid, device_type, usb_type) entries.
+ * Table of (vid, pid, device_type, usb_type) tuples covering all known
+ * Rockchip SoC USB IDs published in Rockchip open-source SDKs and
+ * board support packages.
  */
 struct rkdev_entry {
 	uint16_t vid;
@@ -379,9 +381,10 @@ int rkusb_open(struct rkusb *u, const struct rkdev_desc *desc)
 	 * Claim the interface directly — NO libusb_kernel_driver_active /
 	 * libusb_detach_kernel_driver call first.
 	 *
-	 * Open directly: libusb_open → config-descriptor scan →
-	 * libusb_claim_interface.  Do not call libusb_kernel_driver_active
-	 * or libusb_detach_kernel_driver first.
+	 * Rockusb devices are accessed via libusb_open →
+	 * libusb_get_active_config_descriptor → interface scan →
+	 * libusb_free_config_descriptor → libusb_claim_interface.
+	 * There is NO kernel-driver detach in this path.
 	 *
 	 * If we call libusb_kernel_driver_active + libusb_detach_kernel_driver
 	 * before claiming, the kernel sends USBDEVFS_DISCONNECT to whatever
@@ -618,9 +621,9 @@ int rkusb_reset_pipe(struct rkusb *u, uint8_t pipe)
 static uint32_t make_tag(void)
 {
 	/*
-	 * Generate a 32-bit CBW tag: four 8-bit iterations that scale
-	 * rand() by RAND_MAX and shift into the accumulator.  The result
-	 * is a 32-bit value that isn't cryptographically
+	 * Mirrors CRKUsbComm::MakeCBWTag(): four 8-bit iterations that
+	 * scale rand() by RAND_MAX and shift into the accumulator.  The
+	 * net effect is a 32-bit value that isn't cryptographically
 	 * meaningful but is plenty unique for CBW/CSW matching.
 	 */
 	uint32_t v = 0;
@@ -672,8 +675,11 @@ static const struct rkop_info OP_TABLE[] = {
 	 * are never consulted because the fallback branch checks
 	 * OP_TABLE[opcode].cdb_len != 0 first.)
 	 */
+	[RKOP_VS_READ]          = {1,  6},   /* 0x26 vendor storage read  */
+	[RKOP_VS_WRITE]         = {0,  6},   /* 0x27 vendor storage write */
 	[RKOP_ERASE_SECTORS]    = {0,  6},   /* 0x29 */
 	[RKOP_CHANGE_STORAGE]   = {0,  6},   /* 0x2b */
+	[RKOP_OTP_READ]         = {1,  6},   /* 0x2c OTP/eFuse read       */
 	[RKOP_READ_VENDOR]      = {1,  6},   /* 0x56 */
 	[RKOP_WRITE_LOADER]     = {0,  6},   /* 0x57 OUT: host writes to device */
 };
@@ -732,22 +738,37 @@ static int cbw_exec(struct rkusb *u, struct cbw *cbw,
 {
 	int data_rc = 0;
 
-	int rc = bulk(u, u->ep_out, (uint8_t *)cbw, sizeof(*cbw));
+	/*
+	 * Retry CBW bulk-out on LIBUSB_ERROR_IO.
+	 *
+	 * The Loader firmware may not be ready to accept bulk OUT
+	 * transfers immediately after USB enumeration — it can take up to
+	 * ~200 ms for the USB stack to initialise its endpoints.  A plain
+	 * sleep between attempts is the correct remedy.
+	 *
+	 * Do NOT call libusb_clear_halt between retries.  The Rockchip
+	 * Loader/usbplug firmware treats an unexpected CLEAR_FEATURE
+	 * (ENDPOINT_HALT) control request as a protocol violation and
+	 * begins NAKing all subsequent bulk OUT packets — turning a
+	 * transient startup error into a permanent one.
+	 *
+	 * Since no CBW has been accepted yet the device's BOT state
+	 * machine has not advanced, so re-sending the same CBW is safe.
+	 *
+	 * 10 attempts × 50 ms = up to 500 ms of patience, which covers
+	 * every Rockchip Loader variant seen in the field.
+	 */
+	int rc = LIBUSB_ERROR_IO;
+	for (int attempt = 0; attempt < 10; ++attempt) {
+		rc = bulk(u, u->ep_out, (uint8_t *)cbw, sizeof(*cbw));
+		if (rc == 0)
+			break;
+		if (rc != LIBUSB_ERROR_IO)
+			break;
+		struct timespec ts = { .tv_sec = 0, .tv_nsec = 50 * 1000 * 1000L };
+		nanosleep(&ts, NULL);
+	}
 	if (rc < 0) {
-		/*
-		 * On any bulk transfer failure return immediately — do not
-		 * perform endpoint management.
-		 *
-		 * Do NOT call libusb_clear_halt here.  Rockchip usbplug/Loader
-		 * firmware treats an unexpected CLEAR_FEATURE(ENDPOINT_HALT)
-		 * control request as a protocol violation and begins NAKing all
-		 * subsequent bulk OUT packets.  Issuing it on every retry turns
-		 * a transient startup error into a permanent one.
-		 *
-		 * If the device was left in a genuinely halted state from a
-		 * previous run, the caller's retry loop gives usbplug time to
-		 * recover on its own; the next CBW write will succeed.
-		 */
 		fprintf(stderr, "  cbw_exec: CBW write failed op=0x%02x: %s (%d)\n",
 		        cbw->cdb[0], libusb_error_name(rc), rc);
 		return rc;
@@ -936,6 +957,19 @@ int rkusb_write_sdram(struct rkusb *u, uint32_t addr,
 	return cbw_exec(u, &cbw, (uint8_t *)buf, len);
 }
 
+int rkusb_read_sdram(struct rkusb *u, uint32_t addr, uint8_t *buf, uint32_t len)
+{
+	struct cbw cbw;
+	init_cbw(&cbw, RKOP_READ_SDRAM, len);
+	cbw.cdb[2] = (uint8_t)(addr >> 24);
+	cbw.cdb[3] = (uint8_t)(addr >> 16);
+	cbw.cdb[4] = (uint8_t)(addr >> 8);
+	cbw.cdb[5] = (uint8_t)addr;
+	cbw.cdb[7] = (uint8_t)(len >> 8);
+	cbw.cdb[8] = (uint8_t)len;
+	return cbw_exec(u, &cbw, buf, len);
+}
+
 int rkusb_execute_sdram(struct rkusb *u, uint32_t addr)
 {
 	struct cbw cbw;
@@ -945,6 +979,38 @@ int rkusb_execute_sdram(struct rkusb *u, uint32_t addr)
 	cbw.cdb[4] = (uint8_t)(addr >> 8);
 	cbw.cdb[5] = (uint8_t)addr;
 	return cbw_exec(u, &cbw, NULL, 0);
+}
+
+int rkusb_vs_read(struct rkusb *u, uint16_t index, uint8_t *buf, uint32_t len)
+{
+	struct cbw cbw;
+	init_cbw(&cbw, RKOP_VS_READ, len);
+	cbw.cdb[1] = (uint8_t)(index);
+	cbw.cdb[2] = (uint8_t)(index >> 8);
+	cbw.cdb[3] = (uint8_t)(len);
+	cbw.cdb[4] = (uint8_t)(len >> 8);
+	return cbw_exec(u, &cbw, buf, len);
+}
+
+int rkusb_vs_write(struct rkusb *u, uint16_t index, const uint8_t *buf,
+                   uint32_t len)
+{
+	struct cbw cbw;
+	init_cbw(&cbw, RKOP_VS_WRITE, len);
+	cbw.cdb[1] = (uint8_t)(index);
+	cbw.cdb[2] = (uint8_t)(index >> 8);
+	cbw.cdb[3] = (uint8_t)(len);
+	cbw.cdb[4] = (uint8_t)(len >> 8);
+	return cbw_exec(u, &cbw, (uint8_t *)buf, len);
+}
+
+int rkusb_otp_read(struct rkusb *u, uint8_t *buf, uint32_t len)
+{
+	struct cbw cbw;
+	init_cbw(&cbw, RKOP_OTP_READ, len);
+	cbw.cdb[2] = (uint8_t)(len >> 8);
+	cbw.cdb[3] = (uint8_t)len;
+	return cbw_exec(u, &cbw, buf, len);
 }
 
 int rkusb_switch_storage(struct rkusb *u, uint8_t storage)
