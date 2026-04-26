@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-2.0-only
+ * Copyright (C) 2024 rockutil contributors
+ */
 /*
  * rkrc4.h - Rockchip variant of RC4.  The update tool uses a fixed
  * 16-byte key cycled through the 256-byte state during KSA.  This is

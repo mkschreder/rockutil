@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-2.0-only
+ * Copyright (C) 2024 rockutil contributors
+ */
 /*
  * rkusb.c - libusb-1.0 backed Rockchip Rockusb communication layer.
  */
@@ -487,13 +490,15 @@ static int parse_rockusb_interface(const uint8_t *buf, int len,
  * via a USB control transfer.
  *
  * Background:
- *   The RV1106 transitions from MaskROM to usbplug firmware via an
- *   in-place USB bus reset — no physical disconnect, same bus/device
- *   address.  The kernel re-reads the device and config descriptors
- *   (iManufacturer changes from 0 to 1, bulk endpoints appear) and
- *   updates sysfs in-place.  However the udev event type is "change"
- *   or "bind", which libusb ignores: ctx->usb_devs retains the stale
- *   MaskROM entry, and all libusb descriptor APIs return old data.
+ *   Some Rockchip SoCs transition from MaskROM to usbplug via an
+ *   in-place USB bus reset - same bus/device address.  The kernel
+ *   re-reads the device and config descriptors (iManufacturer changes
+ *   from 0 to 1, bulk endpoints appear) and updates sysfs in-place.
+ *   The udev event type is "change" or "bind", which libusb ignores:
+ *   ctx->usb_devs retains the stale MaskROM entry, and all libusb
+ *   descriptor APIs return old data.  (The RV1106 physically
+ *   disconnects instead, but this function is still useful as a
+ *   non-intrusive open path once the device is already enumerated.)
  *
  *   Sending GET_DESCRIPTOR control transfers to detect the transition
  *   (the previous approach) is also unreliable: opening the USB device

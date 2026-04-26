@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-2.0-only
+ * Copyright (C) 2024 rockutil contributors
+ */
 /*
  * rkcrc.h - CRC helpers used by Rockchip firmware/MaskROM protocols.
  *

@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-2.0-only
+ * Copyright (C) 2024 rockutil contributors
+ */
 /*
  * rkcrc.c - CRC variants used by Rockchip update tooling.
  */

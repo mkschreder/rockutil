@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-2.0-only
+ * Copyright (C) 2024 rockutil contributors
+ */
 /*
  * rkrc4.c - Rockchip fixed-key RC4 (KSA cycles a 16-byte key).
  */

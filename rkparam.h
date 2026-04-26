@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-2.0-only
+ * Copyright (C) 2024 rockutil contributors
+ */
 /*
  * rkparam.h - parser for Rockchip parameter.txt files and a tiny GPT
  *             builder that converts the partition table into a proper

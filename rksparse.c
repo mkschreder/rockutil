@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-2.0-only
+ * Copyright (C) 2024 rockutil contributors
+ */
 /*
  * rksparse.c - Android sparse image expansion used while flashing
  * Rockchip partitions.  Supports v1.0 with chunk types: RAW, FILL,

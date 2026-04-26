@@ -1,3 +1,6 @@
+/* SPDX-License-Identifier: GPL-2.0-only
+ * Copyright (C) 2024 rockutil contributors
+ */
 /*
  * rksparse.h - minimal Android sparse-image decoder.  rockutil
  * detects sparse images (magic 0xed26ff3a) in RKAF partitions and
