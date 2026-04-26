@@ -698,6 +698,16 @@ static int wait_for_loader_mode(struct rkusb *u)
 	 * are self-diagnosing.
 	 */
 
+	/*
+	 * Seeing the device appear as Maskrom immediately after the upload
+	 * completes is normal: the MaskROM firmware is still running while
+	 * it validates and executes the uploaded usbplug blob.  The device
+	 * will disconnect ~2 s after the MaskROM first connected and then
+	 * re-enumerate as Loader once usbplug takes over.  Logging every
+	 * Maskrom poll would only confuse the user, so we suppress those
+	 * and only report noteworthy state transitions.
+	 */
+
 	/* sentinel: "haven't seen anything yet" */
 	uint16_t prev_vid  = 0;
 	uint16_t prev_pid  = 0;
@@ -716,19 +726,30 @@ static int wait_for_loader_mode(struct rkusb *u)
 		for (size_t i = 0; i < list.count; ++i) {
 			const struct rkdev_desc *d = &list.devs[i];
 
-			/* Log every state change for diagnostics. */
-			if (d->vid != prev_vid || d->pid != prev_pid ||
-			    d->usb_type != prev_type) {
+			/*
+			 * Log only non-MASKROM state changes.  A MASKROM device
+			 * visible right after upload is expected (usbplug hasn't
+			 * executed yet); printing it confuses operators into
+			 * thinking the tool is broken and causes premature Ctrl+C.
+			 * Log Loader appearances, unexpected modes, and
+			 * transitions back to Maskrom after a Loader was seen.
+			 */
+			bool noteworthy =
+				d->usb_type != RKUSB_MODE_MASKROM ||
+				prev_type == RKUSB_MODE_LOADER;
+			if (noteworthy &&
+			    (d->vid != prev_vid || d->pid != prev_pid ||
+			     d->usb_type != prev_type)) {
 				fprintf(stderr,
 				        "  [T+%.1fs] VID=0x%04X PID=0x%04X"
 				        " mode=%s\n",
 				        (tries + 1) * 0.05,
 				        d->vid, d->pid,
 				        rkusb_mode_name(d->usb_type));
-				prev_vid  = d->vid;
-				prev_pid  = d->pid;
-				prev_type = d->usb_type;
 			}
+			prev_vid  = d->vid;
+			prev_pid  = d->pid;
+			prev_type = d->usb_type;
 
 			if (!found_loader &&
 			    d->usb_type == RKUSB_MODE_LOADER) {
@@ -744,9 +765,10 @@ static int wait_for_loader_mode(struct rkusb *u)
 		}
 
 		if (list.count == 0 && prev_type != 0xFFFF) {
-			fprintf(stderr,
-			        "  [T+%.1fs] no Rockchip devices visible\n",
-			        (tries + 1) * 0.05);
+			if (prev_type != RKUSB_MODE_MASKROM)
+				fprintf(stderr,
+				        "  [T+%.1fs] no Rockchip devices visible\n",
+				        (tries + 1) * 0.05);
 			prev_vid  = 0;
 			prev_pid  = 0;
 			prev_type = 0xFFFF;
@@ -1168,10 +1190,11 @@ static int cmd_upgrade_firmware(int argc, char **argv)
 			continue;
 
 		/*
-		 * Partitions with nand_addr == 0xffffffff are
-		 * meta-entries (package-file, bootloader) rather than
-		 * flashable.  bootloader is handled via WRITE_LOADER at
-		 * the end; package-file is informational and skipped.
+		 * Partitions with nand_addr == 0xffffffff are meta-entries
+		 * (package-file, bootloader) rather than LBA-flashable.
+		 * Both are skipped here: package-file is informational, and
+		 * bootloader is redundant because "idblock" (nand_addr 0x200)
+		 * already covers the same data via WriteLBA.
 		 */
 		if (p->nand_addr == 0xffffffffu) {
 			fprintf(stderr,
@@ -1199,33 +1222,20 @@ static int cmd_upgrade_firmware(int argc, char **argv)
 	}
 
 	/*
-	 * Finally refresh the bootloader via WRITE_LOADER - this is the
-	 * "bootloader" partition in the RKAF with nand_addr = -1.
+	 * The "bootloader" meta-partition (nand_addr = 0xffffffff) holds the
+	 * raw RKBOOT file.  The Rockchip flash tool writes it via a private
+	 * PrepareIDB/DownloadIDB path that constructs IDB sectors and writes
+	 * them using WRITE_SECTOR (opcode 0x05) at specific flash locations.
+	 *
+	 * We do not need to replicate that: the "idblock" partition
+	 * (flash@LBA = 0x200) already written above contains exactly the same
+	 * binary data (FlashHead + FlashData + FlashBoot totalling 188416 B)
+	 * at the precise sector offset that the RV1106 BootROM scans.
+	 * Writing idblock via WriteLBA is sufficient for the device to boot.
+	 *
+	 * The WRITE_LOADER command (opcode 0x57) is NOT what the original
+	 * tool uses here; sending it to usbplug causes a 20-second timeout.
 	 */
-	for (uint32_t i = 0;
-	     i < f.image.hdr->num_parts && i < 16;
-	     ++i) {
-		const struct rkaf_part *p = &f.image.hdr->parts[i];
-		if (p->image_size == 0 || p->nand_addr != 0xffffffffu)
-			continue;
-		if (strncmp(p->name, "bootloader", sizeof(p->name)) != 0)
-			continue;
-		uint8_t *buf = NULL;
-		size_t   len = 0;
-		rc = rkaf_copy_part(&f.image, p, &buf, &len);
-		if (rc < 0) {
-			fprintf(stderr, "copy %s: %d\n", p->name, rc);
-			goto out;
-		}
-		fprintf(stderr, "\nLoader refresh via WRITE_LOADER (%zu B)\n",
-		        len);
-		rc = rkusb_write_loader_cmd(&u, buf, (uint32_t)len);
-		free(buf);
-		if (rc < 0) {
-			fprintf(stderr, "WRITE_LOADER failed: %d\n", rc);
-			goto out;
-		}
-	}
 
 	rkusb_reset_device(&u, RKRST_NORMAL);
 	printf("Firmware upgrade complete.\n");
