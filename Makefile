@@ -61,3 +61,5 @@ install: $(TARGET)
 
 uninstall:
 	$(RM) $(DESTDIR)$(BINDIR)/$(TARGET)
+
+include tests/Makefile.inc
