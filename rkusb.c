@@ -404,6 +404,139 @@ int rkusb_open(struct rkusb *u, const struct rkdev_desc *desc)
 	return 0;
 }
 
+/*
+ * Open a device by issuing live GET_DESCRIPTOR control transfers rather
+ * than reading from libusb's internal descriptor cache.
+ *
+ * The RV1106 (and potentially other Rockchip SoCs) transitions from
+ * MaskROM to usbplug firmware via an in-place USB bus reset — no
+ * physical disconnect, same bus/device address.  The kernel re-reads the
+ * device and configuration descriptors (iManufacturer changes from 0 to 1,
+ * the bulk-capable interface appears) but the udev event type is "change"
+ * or "bind", not "add".  libusb ignores both, so ctx->usb_devs retains the
+ * stale MaskROM entry forever; libusb_get_device_descriptor() continues to
+ * report iManufacturer=0 and libusb_get_config_descriptor() returns the old
+ * MaskROM config with no bulk endpoints.
+ *
+ * By sending a standard USB GET_DESCRIPTOR(Device) control transfer on the
+ * open fd we get the current firmware's descriptor from the hardware.  We
+ * then do the same for GET_DESCRIPTOR(Configuration) and parse the raw
+ * bytes to locate the Rockusb bulk interface.  This path is always correct
+ * regardless of libusb's cache state.
+ *
+ * Returns 0 on success, negative error code otherwise.
+ * On ENODEV the caller should continue polling (device still running
+ * MaskROM or transitioning).
+ */
+int rkusb_open_live(struct rkusb *u, const struct rkdev_desc *desc)
+{
+	memset(u, 0, sizeof(*u));
+	u->interface = -1;
+
+	libusb_device_handle *handle;
+	int rc = libusb_open(desc->dev, &handle);
+	if (rc < 0)
+		return rc;
+
+	/* GET_DESCRIPTOR(Device) — 18 bytes */
+	uint8_t dd[18];
+	rc = libusb_control_transfer(handle,
+	    LIBUSB_ENDPOINT_IN,           /* bmRequestType: Device→Host, Std, Device */
+	    LIBUSB_REQUEST_GET_DESCRIPTOR,
+	    (LIBUSB_DT_DEVICE << 8) | 0,  /* wValue: type=Device, index=0 */
+	    0, dd, sizeof(dd), 2000);
+	if (rc != (int)sizeof(dd)) {
+		libusb_close(handle);
+		return rc < 0 ? rc : -ENODEV;
+	}
+
+	/*
+	 * If both iManufacturer and iProduct are 0 the device is still running
+	 * MaskROM firmware.  Close without disrupting it.
+	 */
+	uint8_t imfr  = dd[14];
+	uint8_t iprod = dd[15];
+	if (imfr == 0 && iprod == 0) {
+		libusb_close(handle);
+		return -ENODEV;
+	}
+
+	/* GET_DESCRIPTOR(Configuration, index 0) — read header first */
+	uint8_t conf_buf[512];
+	rc = libusb_control_transfer(handle,
+	    LIBUSB_ENDPOINT_IN,
+	    LIBUSB_REQUEST_GET_DESCRIPTOR,
+	    (LIBUSB_DT_CONFIG << 8) | 0,
+	    0, conf_buf, sizeof(conf_buf), 2000);
+	if (rc < 9) {
+		libusb_close(handle);
+		return rc < 0 ? rc : -ENODEV;
+	}
+	int conf_len = rc;
+
+	/*
+	 * Walk the raw descriptor list to find a Rockusb bulk interface:
+	 * bInterfaceClass=0xFF, bInterfaceSubClass=6, bInterfaceProtocol=5,
+	 * with at least one bulk-IN and one bulk-OUT endpoint.
+	 */
+	int     iface_num = -1;
+	uint8_t ep_in = 0, ep_out = 0;
+
+	for (int pos = 0; pos + 2 <= conf_len; ) {
+		int     dlen  = conf_buf[pos];
+		uint8_t dtype = conf_buf[pos + 1];
+
+		if (dlen < 2 || pos + dlen > conf_len)
+			break;
+
+		if (dtype == LIBUSB_DT_INTERFACE && dlen >= 9) {
+			if (conf_buf[pos + 5] == 0xFF &&
+			    conf_buf[pos + 6] == 6 &&
+			    conf_buf[pos + 7] == 5) {
+				iface_num = conf_buf[pos + 2];
+				ep_in = ep_out = 0; /* reset for this interface */
+			} else {
+				iface_num = -1; /* wrong interface class */
+			}
+		} else if (dtype == LIBUSB_DT_ENDPOINT && dlen >= 7 &&
+		           iface_num >= 0) {
+			uint8_t addr = conf_buf[pos + 2];
+			uint8_t attr = conf_buf[pos + 3];
+			if ((attr & 0x03) == LIBUSB_TRANSFER_TYPE_BULK) {
+				if (addr & LIBUSB_ENDPOINT_IN)
+					ep_in  = addr;
+				else
+					ep_out = addr;
+			}
+		}
+		pos += dlen;
+	}
+
+	if (iface_num < 0 || ep_in == 0 || ep_out == 0) {
+		libusb_close(handle);
+		return -ENODEV;
+	}
+
+	rc = libusb_claim_interface(handle, iface_num);
+	if (rc < 0) {
+		libusb_close(handle);
+		return rc;
+	}
+
+	u->handle    = handle;
+	u->interface = iface_num;
+	u->ep_in     = ep_in;
+	u->ep_out    = ep_out;
+	u->timeout_ms = RKUSB_DEFAULT_TIMEOUT_MS;
+	u->desc       = *desc;
+	if (u->desc.dev)
+		u->desc.dev = libusb_ref_device(u->desc.dev);
+	u->desc.usb_type     = RKUSB_MODE_LOADER;
+	u->desc.iManufacturer = imfr;
+	u->desc.iProduct      = iprod;
+	return 0;
+}
+
 void rkusb_close(struct rkusb *u)
 {
 	if (!u)

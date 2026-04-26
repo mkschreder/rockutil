@@ -212,6 +212,20 @@ const char *rkusb_device_type_name(uint16_t dev_type);
 /* Open / close a single device                                       */
 /* ------------------------------------------------------------------ */
 int  rkusb_open(struct rkusb *u, const struct rkdev_desc *desc);
+
+/*
+ * Like rkusb_open(), but discovers the interface and endpoint layout by
+ * issuing live GET_DESCRIPTOR control transfers rather than reading from
+ * libusb's potentially stale internal cache.  Use this when the device
+ * has performed an in-place USB re-enumeration (same bus/device address)
+ * without a physical disconnect — libusb ignores the "change" udev event
+ * so its cached descriptors still reflect the old firmware.
+ *
+ * Returns 0 on success, -ENODEV if the live descriptor shows the device
+ * is still in MaskROM mode (iManufacturer=0, iProduct=0), or another
+ * negative libusb error code on failure.
+ */
+int  rkusb_open_live(struct rkusb *u, const struct rkdev_desc *desc);
 void rkusb_close(struct rkusb *u);
 int  rkusb_reset_pipe(struct rkusb *u, uint8_t pipe);
 
