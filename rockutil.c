@@ -847,11 +847,33 @@ static int wait_for_loader_mode(struct rkusb *u)
 				        u->ep_in, u->ep_out, u->interface);
 				return 0;
 			}
-			/*
-			 * -ENODEV  = still MaskROM or sysfs unavailable → keep polling
-			 * other    = transient open/claim error → keep polling
-			 */
+		/*
+		 * -ENODEV  = still MaskROM or sysfs unavailable → keep polling
+		 * other    = transient open/claim error → keep polling
+		 */
 			(void)opened;
+		}
+
+		/*
+		 * After the physical USB disconnect, the device re-enumerates
+		 * as a Loader once usbplug has finished initialising flash
+		 * (~25–50 s later).  The libusb udev background thread should
+		 * process the "add" event, but empirically it sometimes does
+		 * not — the reconnected device never appears in the cache.
+		 *
+		 * A fresh libusb_init() always calls linux_scan_devices() which
+		 * reads the current USB state directly from sysfs and is
+		 * guaranteed to see the reconnected device.  Reinitialise the
+		 * libusb context every second after the disconnect so we never
+		 * miss the reconnect by more than 1 s.
+		 */
+		if (announced_disconnect && !found_loader && !found_maskrom &&
+		    tries % 20 == 0) {
+			rkusb_library_exit();
+			if (rkusb_library_init() < 0) {
+				fprintf(stderr, "libusb reinit failed\n");
+				return -ENODEV;
+			}
 		}
 	}
 	fprintf(stderr, "Timed out waiting for Loader mode (120 s).\n");
