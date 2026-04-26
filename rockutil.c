@@ -95,6 +95,7 @@ static void print_usage(void)
 	"Version:          V | -v | --version\n"
 	"ListDevice:       LD\n"
 	"TestDevice:       TD\n"
+	"Ready:            READY\n"
 	"ResetDevice:      RD  [subcode]\n"
 	"ResetPipe:        RP  [0|1]            (0 = OUT, 1 = IN)\n"
 	"ReadFlashID:      RID\n"
@@ -103,15 +104,29 @@ static void print_usage(void)
 	"ReadCapability:   RCB\n"
 	"ReadLBA:          RL  <begin> <count> [outfile]\n"
 	"WriteLBA:         WL  <begin> <file>  [--size sectors]\n"
+	"WriteLBANamed:    WLX <partname> <file>\n"
 	"EraseLBA:         EL  <begin> <count>\n"
+	"PrintPartTable:   PPT\n"
 	"DownloadBoot:     DB  <loader.bin>    [--code 0x471|0x472]\n"
 	"UpgradeLoader:    UL  <loader.bin|firmware.img>\n"
 	"UpgradeFirmware:  UF  <firmware.img>\n"
 	"DownloadImage:    DI  <PartName> <image>  [parameter.txt]\n"
+	"WriteParameter:   PRM <parameter.txt>\n"
 	"CreateGPT:        GPT <parameter.txt> <outfile>\n"
+	"WriteGPT:         WGPT <parameter.txt>\n"
 	"EraseFlash:       EF  <parameter.txt>\n"
 	"PrintImage:       PRINT <firmware.img>\n"
+	"PackBoot:         PACK <chip_hex> <ddr.bin> <usb.bin> <ldr.bin> <out.bin>\n"
+	"UnpackBoot:       UNPACK <loader.bin> <outdir>\n"
+	"TagSPL:           TAGSPL <chip_hex> <spl.bin> <out.bin>\n"
+	"DumpSDRAM:        DUMP <addr_hex> <len> [outfile]\n"
+	"WriteSDRAM:       WRITE <addr_hex> <file>\n"
+	"ExecSDRAM:        EXEC <addr_hex>\n"
+	"OTPRead:          OTP <len> [outfile]\n"
+	"SerialNumber:     SN [string]\n"
+	"VendorStorage:    VS dump <idx> <len> | read <idx> <len> <file> | write <idx> <file>\n"
 	"SwitchStorage:    SS  <emmc|nand|sd|spinor|spinand>\n"
+	"Storage:          STORAGE [emmc|nand|sd|spinor|spinand]\n"
 	"-------------------------------------------------------\n",
 	stdout);
 }
@@ -164,6 +179,34 @@ static int open_selected(struct rkusb *u)
 	return rc;
 }
 
+/*
+ * Open the selected device and ensure it is in Loader mode.
+ * Returns 0 on success.  Prints a diagnostic and returns -ENODEV when
+ * the device is in MaskROM mode — callers should direct the user to
+ * run 'UL' or 'UF' first.
+ *
+ * Use this instead of open_selected() for every command that issues
+ * Bulk-Only-Transport CBW packets (i.e. everything except DB, LD).
+ * MaskROM devices only accept vendor control transfers; sending a CBW
+ * to one causes an instant LIBUSB_ERROR_IO.
+ */
+static int open_loader_device(struct rkusb *u)
+{
+	int rc = open_selected(u);
+	if (rc < 0)
+		return rc;
+	if (u->desc.usb_type == RKUSB_MODE_MASKROM) {
+		fprintf(stderr,
+		        "Device is in MaskROM mode — cannot run this command.\n"
+		        "Boot the device into Loader mode first:\n"
+		        "  rockutil UL <loader.bin>      (from RKBOOT file)\n"
+		        "  rockutil UF <firmware.img>    (full image)\n");
+		rkusb_close(u);
+		return -ENODEV;
+	}
+	return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Command handlers                                                    */
 /* ------------------------------------------------------------------ */
@@ -196,7 +239,7 @@ static int cmd_list(int argc, char **argv)
 static int cmd_test(void)
 {
 	struct rkusb u;
-	int rc = open_selected(&u);
+	int rc = open_loader_device(&u);
 	if (rc < 0)
 		return 1;
 	rc = rkusb_test_unit_ready(&u);
@@ -216,7 +259,7 @@ static int cmd_reset(int argc, char **argv)
 		return 1;
 	}
 	struct rkusb u;
-	if (open_selected(&u) < 0)
+	if (open_loader_device(&u) < 0)
 		return 1;
 	int rc = rkusb_reset_device(&u, (uint8_t)sub);
 	if (rc == 0)
@@ -235,7 +278,7 @@ static int cmd_reset_pipe(int argc, char **argv)
 		return 1;
 	}
 	struct rkusb u;
-	if (open_selected(&u) < 0)
+	if (open_loader_device(&u) < 0)
 		return 1;
 	int rc = rkusb_reset_pipe(&u, (uint8_t)pipe);
 	if (rc == 0)
@@ -249,7 +292,7 @@ static int cmd_reset_pipe(int argc, char **argv)
 static int cmd_read_flash_id(void)
 {
 	struct rkusb u;
-	if (open_selected(&u) < 0)
+	if (open_loader_device(&u) < 0)
 		return 1;
 	uint8_t id[5];
 	int rc = rkusb_read_flash_id(&u, id);
@@ -266,7 +309,7 @@ static int cmd_read_flash_id(void)
 static int cmd_read_flash_info(void)
 {
 	struct rkusb u;
-	if (open_selected(&u) < 0)
+	if (open_loader_device(&u) < 0)
 		return 1;
 	uint8_t info[11];
 	int rc = rkusb_read_flash_info(&u, info);
@@ -301,7 +344,7 @@ static int cmd_read_flash_info(void)
 static int cmd_read_chip_info(void)
 {
 	struct rkusb u;
-	if (open_selected(&u) < 0)
+	if (open_loader_device(&u) < 0)
 		return 1;
 	uint8_t info[16];
 	int rc = rkusb_read_chip_info(&u, info);
@@ -331,7 +374,7 @@ static int cmd_read_chip_info(void)
 static int cmd_read_capability(void)
 {
 	struct rkusb u;
-	if (open_selected(&u) < 0)
+	if (open_loader_device(&u) < 0)
 		return 1;
 	uint8_t cap[8];
 	int rc = rkusb_read_capability(&u, cap);
@@ -379,7 +422,7 @@ static int cmd_read_lba(int argc, char **argv)
 	}
 
 	struct rkusb u;
-	if (open_selected(&u) < 0) {
+	if (open_loader_device(&u) < 0) {
 		if (out != stdout)
 			fclose(out);
 		return 1;
@@ -444,7 +487,7 @@ static int cmd_write_lba(int argc, char **argv)
 	fseeko(in, 0, SEEK_SET);
 
 	struct rkusb u;
-	if (open_selected(&u) < 0) {
+	if (open_loader_device(&u) < 0) {
 		fclose(in);
 		return 1;
 	}
@@ -492,7 +535,7 @@ static int cmd_erase_lba(int argc, char **argv)
 	}
 
 	struct rkusb u;
-	if (open_selected(&u) < 0)
+	if (open_loader_device(&u) < 0)
 		return 1;
 	printf("Start to erase lba begin(0x%lx) count(0x%lx)...\n",
 	       begin, count);
@@ -1121,6 +1164,32 @@ static int download_partition(struct rkusb *u, uint32_t base_lba,
                               const uint8_t *data, size_t data_len,
                               const char *label)
 {
+	/*
+	 * UBI images must be written to erased flash.  Detect the UBI
+	 * volume magic (stored as LE u32 at offset 0) and erase the
+	 * target partition region before writing.
+	 */
+	if (data_len >= 4) {
+		uint32_t magic = (uint32_t)data[0] |
+		                 ((uint32_t)data[1] << 8) |
+		                 ((uint32_t)data[2] << 16) |
+		                 ((uint32_t)data[3] << 24);
+		if (magic == RKUBI_MAGIC) {
+			uint32_t erase_count =
+				(uint32_t)((data_len + RKUSB_SECTOR_BYTES - 1)
+				            / RKUSB_SECTOR_BYTES);
+			fprintf(stderr,
+			        "UBI image: erasing %u sectors at LBA 0x%08x\n",
+			        erase_count, base_lba);
+			int rce = rkusb_erase_lba(u, base_lba, erase_count);
+			if (rce < 0) {
+				fprintf(stderr,
+				        "erase before UBI write failed: %d\n", rce);
+				return rce;
+			}
+		}
+	}
+
 	struct dl_ctx ctx = {
 		.u        = u,
 		.base_lba = base_lba,
@@ -1443,7 +1512,7 @@ static int cmd_build_gpt(int argc, char **argv)
 	/* Probe flash size for the device to size the GPT trailer. */
 	uint64_t dev_lbas = 0;
 	struct rkusb u;
-	if (open_selected(&u) == 0) {
+	if (open_loader_device(&u) == 0) {
 		uint8_t info[11];
 		if (rkusb_read_flash_info(&u, info) == 0) {
 			uint32_t flash_size = (uint32_t)info[0]
@@ -1463,7 +1532,7 @@ static int cmd_build_gpt(int argc, char **argv)
 
 	uint8_t *blob = NULL;
 	size_t   blob_len = 0;
-	rc = rk_parameter_build_gpt(&prm, dev_lbas, &blob, &blob_len);
+	rc = rk_parameter_build_gpt_full(&prm, dev_lbas, &blob, &blob_len);
 	if (rc < 0) {
 		fprintf(stderr, "GPT build failed: %d\n", rc);
 		return 1;
@@ -1478,7 +1547,7 @@ static int cmd_build_gpt(int argc, char **argv)
 	fwrite(blob, 1, blob_len, fp);
 	fclose(fp);
 	free(blob);
-	printf("GPT (%zu bytes, %" PRIu64 " LBA device) written to %s\n",
+	printf("GPT (%zu bytes primary+backup, %" PRIu64 " LBA device) written to %s\n",
 	       blob_len, dev_lbas, argv[1]);
 	return 0;
 }
@@ -1594,7 +1663,7 @@ static int cmd_switch_storage(int argc, char **argv)
 	}
 
 	struct rkusb u;
-	if (open_selected(&u) < 0)
+	if (open_loader_device(&u) < 0)
 		return 1;
 	int rc = rkusb_switch_storage(&u, storage);
 	rkusb_close(&u);
@@ -1604,6 +1673,777 @@ static int cmd_switch_storage(int argc, char **argv)
 	}
 	fprintf(stderr, "Switch storage failed: %d\n", rc);
 	return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* READY - verbose TestUnitReady                                       */
+/* ------------------------------------------------------------------ */
+static int cmd_ready(int argc, char **argv)
+{
+	(void)argc;
+	(void)argv;
+	struct rkusb u;
+	if (open_loader_device(&u) < 0)
+		return 1;
+	int rc = rkusb_test_unit_ready(&u);
+	rkusb_close(&u);
+	if (rc == 0) {
+		printf("Chip is ready.\n");
+		return 0;
+	}
+	fprintf(stderr, "Chip is not ready (%d)\n", rc);
+	return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* PPT - print live GPT partition table                                */
+/* ------------------------------------------------------------------ */
+static int cmd_ppt(int argc, char **argv)
+{
+	(void)argc;
+	(void)argv;
+	struct rkusb u;
+	if (open_loader_device(&u) < 0)
+		return 1;
+
+	/* Read 34 sectors = full primary GPT area. */
+	const uint32_t GPT_SECTORS = 34;
+	uint8_t *gpt = malloc(GPT_SECTORS * RKUSB_SECTOR_BYTES);
+	if (!gpt) {
+		rkusb_close(&u);
+		return 1;
+	}
+
+	int rc = rkusb_read_lba(&u, 0, (uint16_t)GPT_SECTORS, gpt);
+	rkusb_close(&u);
+	if (rc < 0) {
+		fprintf(stderr, "ReadLBA failed: %d\n", rc);
+		free(gpt);
+		return 1;
+	}
+
+	rk_gpt_print(gpt, GPT_SECTORS * RKUSB_SECTOR_BYTES);
+	free(gpt);
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* WLX - write image to named partition (looks up LBA from live GPT)  */
+/* ------------------------------------------------------------------ */
+static int cmd_write_lba_named(int argc, char **argv)
+{
+	if (argc < 2) {
+		fprintf(stderr, "Parameter of [WLX] command is invalid.\n");
+		return 1;
+	}
+	const char *part_name = argv[0];
+	const char *img_path  = argv[1];
+
+	struct rkusb u;
+	if (open_loader_device(&u) < 0)
+		return 1;
+
+	/* Read primary GPT (34 sectors). */
+	const uint32_t GPT_SECTORS = 34;
+	uint8_t *gpt = malloc(GPT_SECTORS * RKUSB_SECTOR_BYTES);
+	if (!gpt) {
+		rkusb_close(&u);
+		return 1;
+	}
+	int rc = rkusb_read_lba(&u, 0, (uint16_t)GPT_SECTORS, gpt);
+	if (rc < 0) {
+		fprintf(stderr, "ReadLBA (GPT) failed: %d\n", rc);
+		free(gpt);
+		rkusb_close(&u);
+		return 1;
+	}
+
+	uint64_t first_lba = 0, last_lba = 0;
+	rc = rk_gpt_find_part(gpt, GPT_SECTORS * RKUSB_SECTOR_BYTES,
+	                      part_name, &first_lba, &last_lba);
+	free(gpt);
+	if (rc < 0) {
+		fprintf(stderr, "Partition '%s' not found in live GPT.\n",
+		        part_name);
+		rkusb_close(&u);
+		return 1;
+	}
+
+	/* Load image. */
+	FILE *fp = fopen(img_path, "rb");
+	if (!fp) {
+		fprintf(stderr, "open %s: %s\n", img_path, strerror(errno));
+		rkusb_close(&u);
+		return 1;
+	}
+	fseeko(fp, 0, SEEK_END);
+	off_t size = ftello(fp);
+	fseeko(fp, 0, SEEK_SET);
+	uint8_t *buf = malloc((size_t)size);
+	if (!buf || fread(buf, 1, (size_t)size, fp) != (size_t)size) {
+		fprintf(stderr, "read %s failed\n", img_path);
+		free(buf);
+		fclose(fp);
+		rkusb_close(&u);
+		return 1;
+	}
+	fclose(fp);
+
+	fprintf(stderr, "WLX: partition '%s' @ LBA 0x%" PRIx64 "\n",
+	        part_name, first_lba);
+	rc = download_partition(&u, (uint32_t)first_lba, buf, (size_t)size,
+	                        part_name);
+	rkusb_close(&u);
+	free(buf);
+	return rc ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* PRM - write parameter.txt to device                                 */
+/* ------------------------------------------------------------------ */
+static int cmd_write_parameter(int argc, char **argv)
+{
+	if (argc < 1) {
+		fprintf(stderr, "Parameter of [PRM] command is invalid.\n");
+		return 1;
+	}
+	/* Delegate to DI parameter logic. */
+	char *di_args[] = { (char *)"parameter", argv[0], NULL };
+	return cmd_download_image(2, di_args);
+}
+
+/* ------------------------------------------------------------------ */
+/* PACK - build RKBOOT container from raw blobs                        */
+/* ------------------------------------------------------------------ */
+static int cmd_pack(int argc, char **argv)
+{
+	if (argc < 5) {
+		fprintf(stderr,
+		        "Usage: PACK <chip_hex> <ddr.bin> <usb.bin> "
+		        "<ldr.bin> <out.bin>\n");
+		return 1;
+	}
+	unsigned long chip_val;
+	if (parse_ulong(argv[0], &chip_val)) {
+		fprintf(stderr, "Invalid chip code '%s'\n", argv[0]);
+		return 1;
+	}
+
+	/* Load three payloads. */
+	uint8_t *e471 = NULL, *e472 = NULL, *ldr = NULL;
+	size_t   e471_len = 0, e472_len = 0, ldr_len = 0;
+	int rc = 0;
+
+	FILE *fp;
+#define LOAD(idx, ptr, len)                                          \
+	do {                                                             \
+		fp = fopen(argv[(idx)], "rb");                               \
+		if (!fp) {                                                   \
+			fprintf(stderr, "open %s: %s\n",                         \
+			        argv[(idx)], strerror(errno));                    \
+			rc = 1; goto pack_cleanup;                               \
+		}                                                            \
+		fseeko(fp, 0, SEEK_END);                                     \
+		off_t _sz = ftello(fp);                                      \
+		fseeko(fp, 0, SEEK_SET);                                     \
+		(ptr) = malloc((size_t)_sz);                                 \
+		if (!(ptr) || fread((ptr), 1, (size_t)_sz, fp) != (size_t)_sz) { \
+			fprintf(stderr, "read %s failed\n", argv[(idx)]);         \
+			fclose(fp); rc = 1; goto pack_cleanup;                   \
+		}                                                            \
+		(len) = (size_t)_sz;                                         \
+		fclose(fp);                                                  \
+	} while (0)
+
+	LOAD(1, e471, e471_len);
+	LOAD(2, e472, e472_len);
+	LOAD(3, ldr,  ldr_len);
+#undef LOAD
+
+	uint8_t *out_blob = NULL;
+	size_t   out_len  = 0;
+	rc = rkboot_build((uint32_t)chip_val, 1,
+	                  e471, e471_len,
+	                  e472, e472_len,
+	                  ldr,  ldr_len,
+	                  &out_blob, &out_len);
+	if (rc < 0) {
+		fprintf(stderr, "rkboot_build failed: %d\n", rc);
+		rc = 1;
+		goto pack_cleanup;
+	}
+
+	fp = fopen(argv[4], "wb");
+	if (!fp) {
+		fprintf(stderr, "open %s: %s\n", argv[4], strerror(errno));
+		free(out_blob);
+		rc = 1;
+		goto pack_cleanup;
+	}
+	fwrite(out_blob, 1, out_len, fp);
+	fclose(fp);
+	free(out_blob);
+	printf("PACK: wrote %zu bytes to %s\n", out_len, argv[4]);
+	rc = 0;
+
+pack_cleanup:
+	free(e471);
+	free(e472);
+	free(ldr);
+	return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/* UNPACK - extract RKBOOT entries to files                            */
+/* ------------------------------------------------------------------ */
+static int cmd_unpack(int argc, char **argv)
+{
+	if (argc < 2) {
+		fprintf(stderr,
+		        "Usage: UNPACK <loader.bin> <outdir>\n");
+		return 1;
+	}
+
+	struct rkboot b;
+	int rc = rkboot_load_file(&b, argv[0]);
+	if (rc < 0) {
+		fprintf(stderr, "load %s: %d\n", argv[0], rc);
+		return 1;
+	}
+
+	rc = rkboot_extract(&b, argv[1]);
+	rkboot_dispose(&b);
+	if (rc < 0) {
+		fprintf(stderr, "rkboot_extract failed: %d\n", rc);
+		return 1;
+	}
+	printf("UNPACK: entries written to %s\n", argv[1]);
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* TAGSPL - prepend 4-byte chip tag to a U-Boot SPL binary            */
+/* ------------------------------------------------------------------ */
+static int cmd_tagspl(int argc, char **argv)
+{
+	if (argc < 3) {
+		fprintf(stderr, "Usage: TAGSPL <chip_hex> <spl.bin> <out.bin>\n");
+		return 1;
+	}
+	unsigned long chip_val;
+	if (parse_ulong(argv[0], &chip_val)) {
+		fprintf(stderr, "Invalid chip tag '%s'\n", argv[0]);
+		return 1;
+	}
+
+	FILE *in = fopen(argv[1], "rb");
+	if (!in) {
+		fprintf(stderr, "open %s: %s\n", argv[1], strerror(errno));
+		return 1;
+	}
+	fseeko(in, 0, SEEK_END);
+	off_t spl_size = ftello(in);
+	fseeko(in, 0, SEEK_SET);
+	uint8_t *spl = malloc((size_t)spl_size);
+	if (!spl || fread(spl, 1, (size_t)spl_size, in) != (size_t)spl_size) {
+		fprintf(stderr, "read %s failed\n", argv[1]);
+		free(spl);
+		fclose(in);
+		return 1;
+	}
+	fclose(in);
+
+	FILE *out = fopen(argv[2], "wb");
+	if (!out) {
+		fprintf(stderr, "open %s: %s\n", argv[2], strerror(errno));
+		free(spl);
+		return 1;
+	}
+	uint8_t tag[4];
+	uint32_t chip_le = (uint32_t)chip_val;
+	tag[0] = (uint8_t)(chip_le);
+	tag[1] = (uint8_t)(chip_le >> 8);
+	tag[2] = (uint8_t)(chip_le >> 16);
+	tag[3] = (uint8_t)(chip_le >> 24);
+	fwrite(tag, 1, 4, out);
+	fwrite(spl, 1, (size_t)spl_size, out);
+	fclose(out);
+	free(spl);
+	printf("TAGSPL: wrote %" PRId64 " bytes to %s\n",
+	       (int64_t)spl_size + 4, argv[2]);
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* WGPT - write full GPT (primary + backup) to device                  */
+/* ------------------------------------------------------------------ */
+static int cmd_write_gpt(int argc, char **argv)
+{
+	if (argc < 1) {
+		fprintf(stderr, "Parameter of [WGPT] command is invalid.\n");
+		return 1;
+	}
+
+	struct rk_parameter prm = {0};
+	int rc = rk_parameter_load_file(&prm, argv[0]);
+	if (rc < 0) {
+		fprintf(stderr, "parameter.txt (%s): %d\n", argv[0], rc);
+		return 1;
+	}
+
+	struct rkusb u;
+	if (open_and_ensure_loader(&u, NULL) < 0)
+		return 1;
+
+	/* Get flash size to correctly place the backup GPT. */
+	uint64_t dev_lbas = 0;
+	{
+		uint8_t fi[11] = {0};
+		if (rkusb_read_flash_info(&u, fi) == 0) {
+			dev_lbas = (uint32_t)fi[0] | ((uint32_t)fi[1] << 8) |
+			           ((uint32_t)fi[2] << 16) | ((uint32_t)fi[3] << 24);
+		}
+	}
+	if (dev_lbas == 0) {
+		dev_lbas = 0x800000; /* fallback: 4 GiB */
+		fprintf(stderr, "warning: using fallback device size\n");
+	}
+
+	uint8_t *blob = NULL;
+	size_t   blob_len = 0;
+	rc = rk_parameter_build_gpt_full(&prm, dev_lbas, &blob, &blob_len);
+	if (rc < 0) {
+		fprintf(stderr, "GPT build failed: %d\n", rc);
+		rkusb_close(&u);
+		return 1;
+	}
+
+	const size_t PRIMARY_SECTORS = 34;
+	const size_t BACKUP_SECTORS  = 33;
+
+	/* Write primary GPT area at LBA 0. */
+	uint8_t chunk[RKUSB_MAX_LBA_SECTORS * RKUSB_SECTOR_BYTES];
+	size_t remaining = PRIMARY_SECTORS;
+	uint32_t lba = 0;
+	const uint8_t *src = blob;
+	while (remaining) {
+		uint16_t step = remaining > RKUSB_MAX_LBA_SECTORS
+		                ? (uint16_t)RKUSB_MAX_LBA_SECTORS
+		                : (uint16_t)remaining;
+		memcpy(chunk, src, (size_t)step * RKUSB_SECTOR_BYTES);
+		rc = rkusb_write_lba(&u, lba, step, chunk);
+		if (rc < 0) {
+			fprintf(stderr, "WriteLBA (primary GPT) failed: %d\n", rc);
+			goto wgpt_out;
+		}
+		lba       += step;
+		src       += (size_t)step * RKUSB_SECTOR_BYTES;
+		remaining -= step;
+	}
+
+	/* Write backup GPT area at LBA (dev_lbas - 33). */
+	remaining = BACKUP_SECTORS;
+	lba       = (uint32_t)(dev_lbas - BACKUP_SECTORS);
+	src       = blob + PRIMARY_SECTORS * RKUSB_SECTOR_BYTES;
+	while (remaining) {
+		uint16_t step = remaining > RKUSB_MAX_LBA_SECTORS
+		                ? (uint16_t)RKUSB_MAX_LBA_SECTORS
+		                : (uint16_t)remaining;
+		memcpy(chunk, src, (size_t)step * RKUSB_SECTOR_BYTES);
+		rc = rkusb_write_lba(&u, lba, step, chunk);
+		if (rc < 0) {
+			fprintf(stderr, "WriteLBA (backup GPT) failed: %d\n", rc);
+			goto wgpt_out;
+		}
+		lba       += step;
+		src       += (size_t)step * RKUSB_SECTOR_BYTES;
+		remaining -= step;
+	}
+
+	printf("WGPT: primary GPT @ LBA 0, backup @ LBA %" PRIu64 "\n",
+	       dev_lbas - BACKUP_SECTORS);
+
+wgpt_out:
+	rkusb_close(&u);
+	free(blob);
+	return rc ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* DUMP - read from SDRAM                                              */
+/* ------------------------------------------------------------------ */
+static int cmd_dump_sdram(int argc, char **argv)
+{
+	if (argc < 2) {
+		fprintf(stderr, "Usage: DUMP <addr_hex> <len> [outfile]\n");
+		return 1;
+	}
+	unsigned long addr, len;
+	if (parse_ulong(argv[0], &addr) || parse_ulong(argv[1], &len)) {
+		fprintf(stderr, "Invalid address or length.\n");
+		return 1;
+	}
+	const char *outpath = argc >= 3 ? argv[2] : NULL;
+
+	struct rkusb u;
+	if (open_loader_device(&u) < 0)
+		return 1;
+
+	/* Read in chunks of up to 4 KiB (RKUSB_MAX_CHUNK). */
+	uint8_t *buf = malloc(len);
+	if (!buf) {
+		rkusb_close(&u);
+		return 1;
+	}
+
+	const uint32_t CHUNK = RKUSB_MAX_CHUNK;
+	size_t off = 0;
+	int rc = 0;
+	while (off < len) {
+		uint32_t step = (uint32_t)(len - off);
+		if (step > CHUNK)
+			step = CHUNK;
+		rc = rkusb_read_sdram(&u, (uint32_t)(addr + off),
+		                      buf + off, step);
+		if (rc < 0) {
+			fprintf(stderr, "read_sdram at 0x%lx failed: %d\n",
+			        addr + off, rc);
+			break;
+		}
+		off += step;
+	}
+	rkusb_close(&u);
+
+	if (rc == 0) {
+		if (outpath) {
+			FILE *fp = fopen(outpath, "wb");
+			if (!fp) {
+				fprintf(stderr, "open %s: %s\n",
+				        outpath, strerror(errno));
+				free(buf);
+				return 1;
+			}
+			fwrite(buf, 1, len, fp);
+			fclose(fp);
+			printf("DUMP: %zu bytes written to %s\n", len, outpath);
+		} else {
+			fwrite(buf, 1, len, stdout);
+		}
+	}
+	free(buf);
+	return rc ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* WRITE - write file to SDRAM                                         */
+/* ------------------------------------------------------------------ */
+static int cmd_write_sdram(int argc, char **argv)
+{
+	if (argc < 2) {
+		fprintf(stderr, "Usage: WRITE <addr_hex> <file>\n");
+		return 1;
+	}
+	unsigned long addr;
+	if (parse_ulong(argv[0], &addr)) {
+		fprintf(stderr, "Invalid address.\n");
+		return 1;
+	}
+
+	FILE *in = fopen(argv[1], "rb");
+	if (!in) {
+		fprintf(stderr, "open %s: %s\n", argv[1], strerror(errno));
+		return 1;
+	}
+	fseeko(in, 0, SEEK_END);
+	off_t size = ftello(in);
+	fseeko(in, 0, SEEK_SET);
+	uint8_t *buf = malloc((size_t)size);
+	if (!buf || fread(buf, 1, (size_t)size, in) != (size_t)size) {
+		fprintf(stderr, "read %s failed\n", argv[1]);
+		free(buf);
+		fclose(in);
+		return 1;
+	}
+	fclose(in);
+
+	struct rkusb u;
+	if (open_loader_device(&u) < 0) {
+		free(buf);
+		return 1;
+	}
+
+	const uint32_t CHUNK = RKUSB_MAX_CHUNK;
+	size_t off = 0;
+	int rc = 0;
+	while (off < (size_t)size) {
+		uint32_t step = (uint32_t)((size_t)size - off);
+		if (step > CHUNK)
+			step = CHUNK;
+		rc = rkusb_write_sdram(&u, (uint32_t)(addr + off),
+		                       buf + off, step);
+		if (rc < 0) {
+			fprintf(stderr, "write_sdram at 0x%lx failed: %d\n",
+			        addr + off, rc);
+			break;
+		}
+		off += step;
+	}
+	rkusb_close(&u);
+	free(buf);
+	if (rc == 0)
+		printf("WRITE: %" PRId64 " bytes to SDRAM @ 0x%lx\n",
+		       (int64_t)size, addr);
+	return rc ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* EXEC - execute code at SDRAM address                                */
+/* ------------------------------------------------------------------ */
+static int cmd_exec_sdram(int argc, char **argv)
+{
+	if (argc < 1) {
+		fprintf(stderr, "Usage: EXEC <addr_hex>\n");
+		return 1;
+	}
+	unsigned long addr;
+	if (parse_ulong(argv[0], &addr)) {
+		fprintf(stderr, "Invalid address.\n");
+		return 1;
+	}
+
+	struct rkusb u;
+	if (open_loader_device(&u) < 0)
+		return 1;
+	int rc = rkusb_execute_sdram(&u, (uint32_t)addr);
+	rkusb_close(&u);
+	if (rc == 0) {
+		printf("EXEC: executing at 0x%lx\n", addr);
+		return 0;
+	}
+	fprintf(stderr, "execute_sdram failed: %d\n", rc);
+	return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* OTP - read OTP / eFuse data                                         */
+/* ------------------------------------------------------------------ */
+static int cmd_otp(int argc, char **argv)
+{
+	if (argc < 1) {
+		fprintf(stderr, "Usage: OTP <len> [outfile]\n");
+		return 1;
+	}
+	unsigned long len;
+	if (parse_ulong(argv[0], &len) || len == 0) {
+		fprintf(stderr, "Invalid length.\n");
+		return 1;
+	}
+	const char *outpath = argc >= 2 ? argv[1] : NULL;
+
+	struct rkusb u;
+	if (open_loader_device(&u) < 0)
+		return 1;
+
+	uint8_t *buf = malloc(len);
+	if (!buf) {
+		rkusb_close(&u);
+		return 1;
+	}
+	int rc = rkusb_otp_read(&u, buf, (uint32_t)len);
+	rkusb_close(&u);
+
+	if (rc == 0) {
+		if (outpath) {
+			FILE *fp = fopen(outpath, "wb");
+			if (!fp) {
+				fprintf(stderr, "open %s: %s\n",
+				        outpath, strerror(errno));
+				free(buf);
+				return 1;
+			}
+			fwrite(buf, 1, len, fp);
+			fclose(fp);
+			printf("OTP: %lu bytes written to %s\n", len, outpath);
+		} else {
+			printf("OTP (%lu bytes):\n", len);
+			for (size_t i = 0; i < len; ++i) {
+				printf("%02X ", buf[i]);
+				if ((i & 0xf) == 0xf)
+					printf("\n");
+			}
+			if (len & 0xf)
+				printf("\n");
+		}
+	} else {
+		fprintf(stderr, "otp_read failed: %d\n", rc);
+	}
+	free(buf);
+	return rc ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* SN - read/write serial number (vendor storage index 1)              */
+/* ------------------------------------------------------------------ */
+static int cmd_sn(int argc, char **argv)
+{
+	struct rkusb u;
+	if (open_loader_device(&u) < 0)
+		return 1;
+
+	int rc;
+	if (argc == 0) {
+		/* Read serial number. */
+		uint8_t buf[64] = {0};
+		rc = rkusb_vs_read(&u, 1, buf, sizeof(buf));
+		rkusb_close(&u);
+		if (rc == 0) {
+			/* Null-terminate and print. */
+			buf[sizeof(buf) - 1] = '\0';
+			printf("SN: %s\n", (char *)buf);
+		} else {
+			fprintf(stderr, "SN read failed: %d\n", rc);
+		}
+	} else {
+		/* Write serial number. */
+		const char *sn = argv[0];
+		size_t sn_len = strlen(sn);
+		rc = rkusb_vs_write(&u, 1, (const uint8_t *)sn,
+		                    (uint32_t)sn_len);
+		rkusb_close(&u);
+		if (rc == 0)
+			printf("SN written: %s\n", sn);
+		else
+			fprintf(stderr, "SN write failed: %d\n", rc);
+	}
+	return rc ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* VS - vendor storage read/write                                       */
+/* ------------------------------------------------------------------ */
+static int cmd_vs(int argc, char **argv)
+{
+	if (argc < 1) {
+		fprintf(stderr,
+		        "Usage: VS dump <idx> <len>"
+		        " | read <idx> <len> <file>"
+		        " | write <idx> <file>\n");
+		return 1;
+	}
+	const char *sub = argv[0];
+
+	if (!strcasecmp(sub, "dump") || !strcasecmp(sub, "read")) {
+		if (argc < 3) {
+			fprintf(stderr, "VS %s requires <idx> <len> [file]\n",
+			        sub);
+			return 1;
+		}
+		unsigned long idx, len;
+		if (parse_ulong(argv[1], &idx) || parse_ulong(argv[2], &len)) {
+			fprintf(stderr, "Invalid idx or len.\n");
+			return 1;
+		}
+		const char *outpath = argc >= 4 ? argv[3] : NULL;
+
+		struct rkusb u;
+		if (open_loader_device(&u) < 0)
+			return 1;
+		uint8_t *buf = malloc(len);
+		if (!buf) {
+			rkusb_close(&u);
+			return 1;
+		}
+		int rc = rkusb_vs_read(&u, (uint16_t)idx, buf, (uint32_t)len);
+		rkusb_close(&u);
+		if (rc == 0) {
+			if (outpath) {
+				FILE *fp = fopen(outpath, "wb");
+				if (fp) {
+					fwrite(buf, 1, len, fp);
+					fclose(fp);
+					printf("VS read: %lu bytes to %s\n",
+					       len, outpath);
+				} else {
+					fprintf(stderr, "open %s: %s\n",
+					        outpath, strerror(errno));
+					rc = 1;
+				}
+			} else {
+				printf("VS[%lu] (%lu bytes):\n", idx, len);
+				print_hex(buf, len);
+			}
+		} else {
+			fprintf(stderr, "vs_read failed: %d\n", rc);
+		}
+		free(buf);
+		return rc ? 1 : 0;
+	}
+
+	if (!strcasecmp(sub, "write")) {
+		if (argc < 3) {
+			fprintf(stderr, "VS write requires <idx> <file>\n");
+			return 1;
+		}
+		unsigned long idx;
+		if (parse_ulong(argv[1], &idx)) {
+			fprintf(stderr, "Invalid idx.\n");
+			return 1;
+		}
+		FILE *fp = fopen(argv[2], "rb");
+		if (!fp) {
+			fprintf(stderr, "open %s: %s\n", argv[2], strerror(errno));
+			return 1;
+		}
+		fseeko(fp, 0, SEEK_END);
+		off_t sz = ftello(fp);
+		fseeko(fp, 0, SEEK_SET);
+		uint8_t *buf = malloc((size_t)sz);
+		if (!buf || fread(buf, 1, (size_t)sz, fp) != (size_t)sz) {
+			fprintf(stderr, "read %s failed\n", argv[2]);
+			free(buf);
+			fclose(fp);
+			return 1;
+		}
+		fclose(fp);
+
+		struct rkusb u;
+		if (open_loader_device(&u) < 0) {
+			free(buf);
+			return 1;
+		}
+		int rc = rkusb_vs_write(&u, (uint16_t)idx, buf, (uint32_t)sz);
+		rkusb_close(&u);
+		free(buf);
+		if (rc == 0) {
+			printf("VS write: %" PRId64 " bytes to index %lu\n",
+			       (int64_t)sz, idx);
+			return 0;
+		}
+		fprintf(stderr, "vs_write failed: %d\n", rc);
+		return 1;
+	}
+
+	fprintf(stderr, "Unknown VS subcommand '%s'\n", sub);
+	return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* STORAGE - list storage types or switch (alias SS)                   */
+/* ------------------------------------------------------------------ */
+static int cmd_storage(int argc, char **argv)
+{
+	if (argc == 0) {
+		/* No args: list available storage types. */
+		printf("Available storage types:\n");
+		printf("  flash / nand  (code %d)\n", RK_STORAGE_FLASH);
+		printf("  emmc          (code %d)\n", RK_STORAGE_EMMC);
+		printf("  sd            (code %d)\n", RK_STORAGE_SD);
+		printf("  spinor        (code %d)\n", RK_STORAGE_SPINOR);
+		printf("  spinand       (code %d)\n", RK_STORAGE_SPINAND);
+		return 0;
+	}
+	/* With arg: alias to SS (switch storage). */
+	return cmd_switch_storage(argc, argv);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1639,31 +2479,46 @@ static int run_rci(int a, char **v) { (void)a; (void)v; return cmd_read_chip_inf
 static int run_rcb(int a, char **v) { (void)a; (void)v; return cmd_read_capability(); }
 
 static const struct command COMMANDS[] = {
-	{"H",           cmd_help,           0},
-	{"-h",          cmd_help,           0},
-	{"--help",      cmd_help,           0},
-	{"V",           cmd_version,        0},
-	{"-v",          cmd_version,        0},
-	{"--version",   cmd_version,        0},
-	{"LD",          cmd_list,           0},
-	{"TD",          run_td,             0},
-	{"RD",          cmd_reset,          0},
-	{"RP",          cmd_reset_pipe,     0},
-	{"RID",         run_rid,            0},
-	{"RFI",         run_rfi,            0},
-	{"RCI",         run_rci,            0},
-	{"RCB",         run_rcb,            0},
-	{"RL",          cmd_read_lba,       2},
-	{"WL",          cmd_write_lba,      2},
-	{"EL",          cmd_erase_lba,      2},
-	{"DB",          cmd_download_boot,  1},
-	{"UL",          cmd_upgrade_loader, 1},
-	{"UF",          cmd_upgrade_firmware, 1},
-	{"DI",          cmd_download_image, 2},
-	{"GPT",         cmd_build_gpt,      2},
-	{"EF",          cmd_erase_flash,    1},
-	{"PRINT",       cmd_print,          1},
-	{"SS",          cmd_switch_storage, 1},
+	{"H",           cmd_help,              0},
+	{"-h",          cmd_help,              0},
+	{"--help",      cmd_help,              0},
+	{"V",           cmd_version,           0},
+	{"-v",          cmd_version,           0},
+	{"--version",   cmd_version,           0},
+	{"LD",          cmd_list,              0},
+	{"TD",          run_td,                0},
+	{"READY",       cmd_ready,             0},
+	{"RD",          cmd_reset,             0},
+	{"RP",          cmd_reset_pipe,        0},
+	{"RID",         run_rid,               0},
+	{"RFI",         run_rfi,               0},
+	{"RCI",         run_rci,               0},
+	{"RCB",         run_rcb,               0},
+	{"RL",          cmd_read_lba,          2},
+	{"WL",          cmd_write_lba,         2},
+	{"WLX",         cmd_write_lba_named,   2},
+	{"EL",          cmd_erase_lba,         2},
+	{"PPT",         cmd_ppt,               0},
+	{"DB",          cmd_download_boot,     1},
+	{"UL",          cmd_upgrade_loader,    1},
+	{"UF",          cmd_upgrade_firmware,  1},
+	{"DI",          cmd_download_image,    2},
+	{"PRM",         cmd_write_parameter,   1},
+	{"GPT",         cmd_build_gpt,         2},
+	{"WGPT",        cmd_write_gpt,         1},
+	{"EF",          cmd_erase_flash,       1},
+	{"PRINT",       cmd_print,             1},
+	{"PACK",        cmd_pack,              5},
+	{"UNPACK",      cmd_unpack,            2},
+	{"TAGSPL",      cmd_tagspl,            3},
+	{"DUMP",        cmd_dump_sdram,        2},
+	{"WRITE",       cmd_write_sdram,       2},
+	{"EXEC",        cmd_exec_sdram,        1},
+	{"OTP",         cmd_otp,               1},
+	{"SN",          cmd_sn,                0},
+	{"VS",          cmd_vs,                1},
+	{"SS",          cmd_switch_storage,    1},
+	{"STORAGE",     cmd_storage,           0},
 };
 
 int main(int argc, char **argv)
