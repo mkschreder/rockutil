@@ -711,34 +711,32 @@ static int wait_for_loader_mode(struct rkusb *u)
 	}
 
 	/*
-	 * Step 3: poll for up to 30 s (600 × 50 ms).
+	 * Step 3: poll for up to 120 s (2400 × 50 ms).
+	 *
+	 * The RV1106 usbplug firmware physically disconnects from USB at
+	 * ~T+5 s (after the MaskROM loader upload completes) so it can
+	 * initialise DDR and NAND/eMMC flash.  The device then reconnects
+	 * ~25–35 s later in Loader mode with a fresh device address.
 	 *
 	 * Two detection paths run in parallel every poll iteration:
 	 *
-	 *   Path A — standard: device appears as LOADER in libusb's cache
-	 *     (physically disconnected and reconnected with a new address;
-	 *     a fresh cache entry with iMfr=1 triggers the tiebreaker).
-	 *     Uses rkusb_open(), which relies on cached config descriptor.
+	 *   Path A — standard enumeration: device appears as LOADER in
+	 *     libusb's cache (fresh "add" udev event → correct iMfr=1 →
+	 *     LOADER classification via the tiebreaker).  This is the
+	 *     normal path for the RV1106 after its physical reconnect.
 	 *
-	 *   Path B — live probe: device appears as MASKROM in libusb's
-	 *     cache (in-place re-enumeration; cache is permanently stale).
-	 *     Uses rkusb_open_live(), which issues GET_DESCRIPTOR control
-	 *     transfers on the open fd to read the CURRENT descriptor from
-	 *     the hardware.  If iMfr != 0 the current firmware has a bulk
-	 *     interface; the config descriptor is also read live, parsed,
-	 *     and used to claim the correct interface.
-	 *
-	 * The live probe is safe to run on the real MaskROM (if it's still
-	 * executing during the first few polls): GET_DESCRIPTOR is a
-	 * standard USB request every device must handle, and rkusb_open_live
-	 * closes the device without disruption when iMfr=0 is returned.
+	 *   Path B — sysfs probe: for SoCs that perform an in-place USB
+	 *     bus reset (no physical disconnect), libusb's cache stays
+	 *     stale.  Reads /sys/bus/usb/devices/BUS-PATH/descriptors —
+	 *     zero USB traffic, non-intrusive — and detects iMfr→1.
 	 */
 
 	uint16_t prev_vid  = 0;
 	uint16_t prev_pid  = 0;
 	uint16_t prev_type = 0xFFFF;
+	bool     announced_disconnect = false;
 
-	for (int tries = 0; tries < 600; ++tries) {
+	for (int tries = 0; tries < 2400; ++tries) {
 		usleep(50 * 1000);
 
 		struct rkdev_list list = {0};
@@ -783,14 +781,21 @@ static int wait_for_loader_mode(struct rkusb *u)
 		}
 
 		if (list.count == 0 && prev_type != 0xFFFF) {
-			if (prev_type != RKUSB_MODE_MASKROM)
+			if (!announced_disconnect) {
 				fprintf(stderr,
-				        "  [T+%.1fs] no Rockchip devices visible\n",
-				        (tries + 1) * 0.05);
+				        "  USB disconnect — usbplug initialising flash,"
+				        " waiting up to 120 s...\n");
+				announced_disconnect = true;
+			}
 			prev_vid  = 0;
 			prev_pid  = 0;
 			prev_type = 0xFFFF;
 		}
+
+		/* Print a dot every 5 s while no device is visible. */
+		if (list.count == 0 && tries > 0 && tries % 100 == 0)
+			fprintf(stderr, "  [T+%.0fs] still waiting...\n",
+			        (tries + 1) * 0.05);
 
 		rkusb_free_list(&list);
 
@@ -844,16 +849,12 @@ static int wait_for_loader_mode(struct rkusb *u)
 			}
 			/*
 			 * -ENODEV  = still MaskROM or sysfs unavailable → keep polling
-			 * other    = transient open/claim error → log and keep polling
+			 * other    = transient open/claim error → keep polling
 			 */
-			if (opened != -ENODEV && tries % 20 == 0)
-				fprintf(stderr,
-				        "  [sysfs probe T+%.1fs] %s — retrying\n",
-				        (tries + 1) * 0.05,
-				        libusb_error_name(opened));
+			(void)opened;
 		}
 	}
-	fprintf(stderr, "Timed out waiting for Loader mode.\n");
+	fprintf(stderr, "Timed out waiting for Loader mode (120 s).\n");
 	return -ETIMEDOUT;
 }
 
