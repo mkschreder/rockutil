@@ -243,6 +243,12 @@ setup() {
     local cnt
     cnt=$(oplog_count "WRITE_LBA")
     [ "$cnt" -ge 1 ]
+
+    # Verify every byte of the 65536-byte payload landed correctly
+    local out="$BATS_TEST_TMPDIR/random_64k_readback.bin"
+    run run_tool RL 0x200 128 "$out"
+    [ "$status" -eq 0 ]
+    cmp --silent "$infile" "$out"
 }
 
 @test "WL --size 4 truncates write to 4 sectors" {
@@ -622,6 +628,13 @@ setup() {
     run run_tool WLX misc "${FIXTURE_DIR}/random_4k.bin"
     [ "$status" -eq 0 ]
     oplog_has_op "WRITE_LBA"
+
+    # misc is at LBA 0x4000 (16384) per parameter.txt CMDLINE; read back and
+    # verify every byte of the 4096-byte payload
+    local out="$BATS_TEST_TMPDIR/wlx_misc_readback.bin"
+    run run_tool RL 0x4000 8 "$out"
+    [ "$status" -eq 0 ]
+    cmp --silent "${FIXTURE_DIR}/random_4k.bin" "$out"
 }
 
 # =========================================================================
@@ -639,6 +652,16 @@ setup() {
     local cnt
     cnt=$(oplog_count "ERASE_LBA")
     [ "$cnt" -eq 0 ]
+
+    # Tool must emit a "Validating misc ..." progress line proving read-back ran
+    [[ "$output" =~ "Validating misc" ]]
+    oplog_has_op "READ_LBA"
+
+    # Independent RL readback confirms every byte matches the source image
+    local out="$BATS_TEST_TMPDIR/ubi_di_readback.bin"
+    run run_tool RL 0x4000 8 "$out"
+    [ "$status" -eq 0 ]
+    cmp --silent "${FIXTURE_DIR}/ubi_4k.img" "$out"
 }
 
 # =========================================================================
@@ -650,4 +673,14 @@ setup() {
         "${FIXTURE_DIR}/parameter.txt"
     [ "$status" -eq 0 ]
     oplog_has_op "WRITE_LBA"
+
+    # Tool must validate the sparse image too — re-expands and reads back
+    [[ "$output" =~ "Validating misc" ]]
+
+    # After expansion the sparse RAW chunk (4096 × 0xAB) must appear verbatim
+    # at misc LBA (0x4000).  Compare against the pre-generated reference file.
+    local out="$BATS_TEST_TMPDIR/sparse_di_readback.bin"
+    run run_tool RL 0x4000 8 "$out"
+    [ "$status" -eq 0 ]
+    cmp --silent "${FIXTURE_DIR}/sparse_expanded_4k.bin" "$out"
 }

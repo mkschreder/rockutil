@@ -485,6 +485,30 @@ def main(out_dir: str) -> None:
     print(f"  sparse_4k.img: {len(sparse_data)} bytes "
           f"(header={len(file_hdr)}B + 1 chunk of {len(raw_data)}B raw)")
 
+    # -----------------------------------------------------------------------
+    # Reference binary files for data-integrity round-trip tests.
+    # Each file holds the *exact* bytes expected in flash after the
+    # corresponding write operation, letting tests do byte-for-byte cmp
+    # against an RL readback.
+    # -----------------------------------------------------------------------
+    with open(os.path.join(out_dir, "misc_4k.img"), "wb") as f:
+        f.write(misc_data)
+    print(f"  misc_4k.img: {len(misc_data)} bytes (0xDD fill, "
+          "matches misc partition in firmware.img)")
+
+    with open(os.path.join(out_dir, "rootfs_ubi_4k.img"), "wb") as f:
+        f.write(rootfs_data)
+    print(f"  rootfs_ubi_4k.img: {len(rootfs_data)} bytes "
+          "(UBI magic + 0xEE fill, matches rootfs partition in firmware.img)")
+
+    # sparse_expanded_4k.bin: the raw payload bytes that must appear in flash
+    # after rockutil expands sparse_4k.img (one RAW chunk, all 0xAB bytes).
+    sparse_expanded = raw_data  # raw_data = b"\xAB" * (chunk_blks * blk_sz)
+    with open(os.path.join(out_dir, "sparse_expanded_4k.bin"), "wb") as f:
+        f.write(sparse_expanded)
+    print(f"  sparse_expanded_4k.bin: {len(sparse_expanded)} bytes "
+          "(0xAB fill, expected flash content after sparse_4k.img write)")
+
     print(f"\nFixtures written to {out_dir}")
 
 

@@ -150,20 +150,32 @@ PYEOF
     _restart_maskrom
 }
 
+@test "UF firmware.img emits 'Validating' lines for each written partition" {
+    run run_tool UF "$FIXTURE_DIR/firmware.img"
+    [ "$status" -eq 0 ]
+
+    # Each non-sparse partition must produce a "Validating <name> ... 100%" line,
+    # proving that the tool read the data back and compared it.
+    [[ "$output" =~ "Validating parameter" ]]
+    [[ "$output" =~ "Validating misc" ]]
+    [[ "$output" =~ "Validating rootfs" ]]
+
+    # The oplog must contain READ_LBA entries from the validation reads
+    oplog_has_op "READ_LBA"
+
+    _restart_maskrom
+}
+
 @test "UF firmware.img: after flash, readback of misc partition matches fixture data" {
     run run_tool UF "$FIXTURE_DIR/firmware.img"
     [ "$status" -eq 0 ]
 
-    # Read back misc partition (4096 bytes = 8 sectors at LBA 0x2000=8192)
-    # The emulator is now in Loader mode (post-transition)
+    # The tool itself validates on-device; we do an independent RL readback
+    # here to confirm the exact bytes (0xDD * 4096) landed correctly.
     local out="$BATS_TEST_TMPDIR/misc_readback.bin"
     run run_tool RL 0x2000 8 "$out"
     [ "$status" -eq 0 ]
-
-    # misc_data in fixture is 0xDD * 4096
-    local b0
-    b0=$(od -An -tx1 -j0 -N1 "$out" | tr -d ' \n')
-    [ "$b0" = "dd" ]
+    cmp --silent "$FIXTURE_DIR/misc_4k.img" "$out"
 
     _restart_maskrom
 }
@@ -185,10 +197,11 @@ PYEOF
     cnt=$(oplog_count "ERASE_LBA")
     [ "$cnt" -eq 0 ]
 
-    # rootfs data must still be present after the erase+write
+    # Verify rootfs data was written in full (UBI magic + 0xEE fill)
     local out="$BATS_TEST_TMPDIR/rootfs_readback.bin"
     run run_tool RL 0x4000 8 "$out"
     [ "$status" -eq 0 ]
+    cmp --silent "$FIXTURE_DIR/rootfs_ubi_4k.img" "$out"
 
     _restart_maskrom
 }
@@ -237,6 +250,12 @@ PYEOF
 
     # misc is at lba_start = 0x4000 = 16384 in parameter.txt
     oplog_has_op "WRITE_LBA" "lba" "16384"
+
+    # Read back 8 sectors (4096 bytes) and compare byte-for-byte
+    local out="$BATS_TEST_TMPDIR/misc_di_readback.bin"
+    run run_tool RL 0x4000 8 "$out"
+    [ "$status" -eq 0 ]
+    cmp --silent "$FIXTURE_DIR/random_4k.bin" "$out"
 
     stop_emulator
     start_emulator "maskrom"
