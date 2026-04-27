@@ -150,11 +150,9 @@ FIXTURE_DIR="${FIXTURE_DIR:-tests/build/fixtures}"
 
 @test "GPT fallback warns about missing device size" {
     local out="$BATS_TEST_TMPDIR/gpt_warn.bin"
-    run "$TOOL" GPT "$FIXTURE_DIR/parameter.txt" "$out"
+    run --separate-stderr "$TOOL" GPT "$FIXTURE_DIR/parameter.txt" "$out"
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "warning" ]] || [[ "${lines[@]}" =~ "warning" ]] || \
-        [[ "$(cat /dev/stderr 2>/dev/null)" =~ "warning" ]] || \
-        [[ "$output$stderr" =~ "fallback" ]]
+    [[ "$stderr" =~ "warning: using fallback device size" ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -240,20 +238,6 @@ FIXTURE_DIR="${FIXTURE_DIR:-tests/build/fixtures}"
     local sig
     sig=$(dd if="$out" bs=1 skip=33792 count=8 2>/dev/null | cat)
     [ "$sig" = "EFI PART" ]
-}
-
-@test "GPT primary and backup both contain EFI PART magic" {
-    local out="$BATS_TEST_TMPDIR/gpt_both.bin"
-    run "$TOOL" GPT "$FIXTURE_DIR/parameter.txt" "$out"
-    [ "$status" -eq 0 ]
-    # Primary header at byte 512
-    local primary_sig
-    primary_sig=$(dd if="$out" bs=1 skip=512 count=8 2>/dev/null | cat)
-    [ "$primary_sig" = "EFI PART" ]
-    # Backup header at byte 33792
-    local backup_sig
-    backup_sig=$(dd if="$out" bs=1 skip=33792 count=8 2>/dev/null | cat)
-    [ "$backup_sig" = "EFI PART" ]
 }
 
 # ---------------------------------------------------------------------------

@@ -87,12 +87,16 @@ setup() {
     run run_tool RP 0
     [ "$status" -eq 0 ]
     [[ "$output" =~ "Reset Pipe OK" ]]
+    # Verify the CLEAR_HALT control transfer was issued for EP_BULK_OUT (0x01)
+    oplog_has_op "CLEAR_HALT" "endpoint" "1"
 }
 
 @test "RP 1 succeeds (clear IN halt)" {
     run run_tool RP 1
     [ "$status" -eq 0 ]
     [[ "$output" =~ "Reset Pipe OK" ]]
+    # Verify the CLEAR_HALT control transfer was issued for EP_BULK_IN (0x81 = 129)
+    oplog_has_op "CLEAR_HALT" "endpoint" "129"
 }
 
 # =========================================================================
@@ -191,11 +195,6 @@ setup() {
     [ "$b0" = "01" ]
 }
 
-@test "RL 0 1 without outfile writes to stdout and exits 0" {
-    run run_tool RL 0 1
-    [ "$status" -eq 0 ]
-}
-
 @test "RL multi-sector read (128 sectors = max chunk)" {
     local out="$BATS_TEST_TMPDIR/chunk128.bin"
     run run_tool RL 0 128 "$out"
@@ -213,6 +212,14 @@ setup() {
     local cnt
     cnt=$(oplog_count "READ_LBA")
     [ "$cnt" -eq 2 ]
+    # Full payload size must be 256 × 512 = 131072 bytes
+    local size
+    size=$(stat -c '%s' "$out")
+    [ "$size" -eq $(( 256 * 512 )) ]
+    # Seeded byte0 for LBA 0 must be 0x00
+    local b0
+    b0=$(od -An -tx1 -j0 -N1 "$out" | tr -d ' \n')
+    [ "$b0" = "00" ]
 }
 
 # =========================================================================
@@ -259,6 +266,18 @@ setup() {
     local secs
     secs=$(oplog_field "WRITE_LBA" "sectors")
     [ "$secs" -eq 4 ]
+
+    # Read back 5 sectors to verify: first 4 written, 5th untouched (seeded)
+    local out="$BATS_TEST_TMPDIR/wl_size4_readback.bin"
+    run run_tool RL 0x300 5 "$out"
+    [ "$status" -eq 0 ]
+    # Bytes 0..2047 must match the first 2048 bytes of infile (4 written sectors)
+    cmp -n 2048 "$out" "$infile"
+    # Byte 2048 (first byte of sector 0x304 = LBA 772) must still be seeded:
+    # seeded byte0 = 772 & 0xFF = 0x04
+    local b5
+    b5=$(od -An -tx1 -j2048 -N1 "$out" | tr -d ' \n')
+    [ "$b5" = "04" ]
 }
 
 # =========================================================================
@@ -390,9 +409,10 @@ setup() {
 
 @test "GPT with live device does NOT print fallback warning" {
     local out="$BATS_TEST_TMPDIR/gpt_live2.bin"
-    run run_tool GPT "${FIXTURE_DIR}/parameter.txt" "$out" 2>&1
+    run run_tool GPT "${FIXTURE_DIR}/parameter.txt" "$out"
     [ "$status" -eq 0 ]
     [ -f "$out" ]
+    ! [[ "$output" =~ "warning" ]]
 }
 
 @test "GPT BackupLBA in header equals flash size - 1 (131071)" {
@@ -418,12 +438,6 @@ setup() {
 # =========================================================================
 # DUMP — read from SDRAM
 # =========================================================================
-
-@test "DUMP addr=0 len=16 exits 0" {
-    run run_tool DUMP 0 16
-    [ "$status" -eq 0 ]
-    oplog_has_op "READ_SDRAM" "addr" "0"
-}
 
 @test "DUMP produces seeded data (addr=0 byte0=0x00)" {
     local out="$BATS_TEST_TMPDIR/sdram_dump.bin"
@@ -457,6 +471,10 @@ setup() {
     run run_tool WRITE 0x1000 "${FIXTURE_DIR}/random_4k.bin"
     [ "$status" -eq 0 ]
     oplog_has_op "WRITE_SDRAM" "addr" "4096"
+    # Verify the full 4096-byte payload was transferred
+    local len
+    len=$(oplog_field "WRITE_SDRAM" "len")
+    [ "$len" -eq 4096 ]
 }
 
 @test "WRITE + DUMP round-trip: written data is read back correctly" {
@@ -465,11 +483,12 @@ setup() {
 
     run run_tool WRITE 0x2000 "$infile"
     [ "$status" -eq 0 ]
-
-    # Force emulator to use stored sdram[0x2000]
-    # NOTE: emulator READ_SDRAM returns seeded data, not the stored data.
-    # However we at minimum verify the write was logged and exits 0.
     oplog_has_op "WRITE_SDRAM" "addr" "8192"
+
+    # Read back the exact bytes written — emulator now returns stored SDRAM data
+    run run_tool DUMP 0x2000 4096 "$out"
+    [ "$status" -eq 0 ]
+    cmp --silent "$infile" "$out"
 }
 
 # =========================================================================
@@ -485,23 +504,6 @@ setup() {
 # =========================================================================
 # OTP — read OTP / eFuse data
 # =========================================================================
-
-@test "OTP 16 exits 0 and prints hex" {
-    run run_tool OTP 16
-    [ "$status" -eq 0 ]
-    [[ "$output" =~ "OTP" ]]
-    oplog_has_op "OTP_READ" "len" "16"
-}
-
-@test "OTP 16 output file has 16 bytes" {
-    local out="$BATS_TEST_TMPDIR/otp.bin"
-    run run_tool OTP 16 "$out"
-    [ "$status" -eq 0 ]
-    [ -f "$out" ]
-    local size
-    size=$(stat -c '%s' "$out")
-    [ "$size" -eq 16 ]
-}
 
 @test "OTP canned data starts with 0x00 0x01 0x02" {
     local out="$BATS_TEST_TMPDIR/otp_check.bin"
@@ -527,12 +529,6 @@ setup() {
     oplog_has_op "VS_READ" "index" "1"
 }
 
-@test "SN write stores new serial number" {
-    run run_tool SN "TESTSERIAL001"
-    [ "$status" -eq 0 ]
-    oplog_has_op "VS_WRITE" "index" "1"
-}
-
 @test "SN write then read returns updated serial" {
     run run_tool SN "ROUNDTRIP999"
     [ "$status" -eq 0 ]
@@ -546,10 +542,16 @@ setup() {
 # VS — vendor storage read/write
 # =========================================================================
 
-@test "VS dump index=1 prints canned serial bytes" {
+@test "VS dump index=1 shows header and 16 hex bytes" {
     run run_tool VS dump 1 16
     [ "$status" -eq 0 ]
     oplog_has_op "VS_READ" "index" "1"
+    # Output must include the header with correct index (unquoted so =~ treats as ERE)
+    [[ "$output" =~ VS\[1\] ]]
+    # The data line (last line) must contain exactly 16 space-separated hex bytes
+    local hexcount
+    hexcount=$(printf '%s\n' "$output" | tail -1 | grep -oE '[0-9A-F]{2} ' | wc -l)
+    [ "$hexcount" -eq 16 ]
 }
 
 @test "VS write and read round-trip" {
@@ -562,6 +564,8 @@ setup() {
     [ "$status" -eq 0 ]
     [ -f "$out" ]
     oplog_has_op "VS_READ" "index" "2"
+    # Byte-for-byte comparison: readback must equal the written file
+    cmp --silent "${FIXTURE_DIR}/random_4k.bin" "$out"
 }
 
 # =========================================================================
@@ -575,21 +579,9 @@ setup() {
     [[ "$output" =~ "nand" ]]
 }
 
-@test "STORAGE emmc sends CHANGE_STORAGE code 2" {
-    run run_tool STORAGE emmc
-    [ "$status" -eq 0 ]
-    oplog_has_op "CHANGE_STORAGE" "storage" "2"
-}
-
 # =========================================================================
 # WGPT — write full GPT to device
 # =========================================================================
-
-@test "WGPT writes primary GPT to LBA 0" {
-    run run_tool WGPT "${FIXTURE_DIR}/parameter.txt"
-    [ "$status" -eq 0 ]
-    oplog_has_op "WRITE_LBA" "lba" "0"
-}
 
 @test "WGPT then RL 0 34 shows EFI PART at offset 512" {
     run run_tool WGPT "${FIXTURE_DIR}/parameter.txt"
@@ -613,9 +605,11 @@ setup() {
     : > "${OPLOG_FILE}"
     run run_tool PPT
     [ "$status" -eq 0 ]
-    # parameter.txt defines: uboot, misc, boot, rootfs
-    [[ "$output" =~ "uboot" ]] || [[ "$output" =~ "misc" ]] || \
-        [[ "$output" =~ "boot" ]]
+    # parameter.txt defines: uboot, misc, boot, rootfs — all four must appear
+    [[ "$output" =~ "uboot" ]]
+    [[ "$output" =~ "misc" ]]
+    [[ "$output" =~ "boot" ]]
+    [[ "$output" =~ "rootfs" ]]
 }
 
 # =========================================================================

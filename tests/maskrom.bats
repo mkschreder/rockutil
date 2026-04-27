@@ -284,19 +284,34 @@ PYEOF
 # EF — erase flash per parameter.txt
 # =========================================================================
 
-@test "EF parameter.txt erases each defined partition (one ERASE_LBA per part)" {
+@test "EF parameter.txt erases each defined partition" {
     stop_emulator
     start_emulator "loader"
     wait_for_usb "2207" "350b" 10
     : > "${OPLOG_FILE}"
 
+    # Pre-load non-zero data into misc so the zero-readback check is meaningful
+    run_tool WL 0x4000 "$FIXTURE_DIR/random_4k.bin" >/dev/null 2>&1 || true
+    : > "${OPLOG_FILE}"
+
     run run_tool EF "$FIXTURE_DIR/parameter.txt"
     [ "$status" -eq 0 ]
 
-    # parameter.txt defines 4 partitions: uboot, misc, boot, rootfs
-    local cnt
-    cnt=$(oplog_count "ERASE_LBA")
-    [ "$cnt" -ge 3 ]
+    # All 4 partition start LBAs must appear in the ERASE_LBA oplog entries:
+    #   uboot@0x2000=8192  misc@0x4000=16384  boot@0x6000=24576  rootfs@0x16000=90112
+    # (Large partitions may split into multiple CBWs, so we check LBAs not count.)
+    oplog_has_op "ERASE_LBA" "lba" "8192"
+    oplog_has_op "ERASE_LBA" "lba" "16384"
+    oplog_has_op "ERASE_LBA" "lba" "24576"
+    oplog_has_op "ERASE_LBA" "lba" "90112"
+
+    # Verify flash: misc (LBA 0x4000) must now be all zeros
+    local out="$BATS_TEST_TMPDIR/ef_misc_check.bin"
+    run run_tool RL 0x4000 1 "$out"
+    [ "$status" -eq 0 ]
+    local nz
+    nz=$(tr -d '\000' < "$out" | wc -c)
+    [ "$nz" -eq 0 ]
 
     stop_emulator
     start_emulator "maskrom"
@@ -336,9 +351,15 @@ PYEOF
 # Negative MaskROM tests
 # =========================================================================
 
-@test "DB loader_corrupt.bin handles gracefully (does not crash)" {
+@test "DB loader_corrupt.bin proceeds (DB sends raw bytes, does not parse RKBOOT)" {
     run run_tool DB "$FIXTURE_DIR/loader_corrupt.bin"
-    [ "$status" -eq 0 ] || [ "$status" -eq 1 ]
+    # DB never parses the RKBOOT structure, so a corrupt file CRC does not cause
+    # failure — the raw bytes are sent as-is.
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Download Boot Success" ]]
+    # The outgoing control transfer must carry a valid CCITT CRC appended by the tool
+    oplog_has_op "ctrl_upload" "crc_ok" "True"
+    _restart_maskrom
 }
 
 @test "UL non-existent file exits 1" {
