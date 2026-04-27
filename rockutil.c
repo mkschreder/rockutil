@@ -1162,7 +1162,8 @@ static int dl_sparse_cb(void *user, uint32_t lba, const uint8_t *data,
 
 static int download_partition(struct rkusb *u, uint32_t base_lba,
                               const uint8_t *data, size_t data_len,
-                              const char *label, uint32_t sector_per_blk)
+                              const char *label, uint32_t sector_per_blk,
+                              uint32_t partition_sectors)
 {
 	/*
 	 * UBI images must be written to cleanly erased NAND blocks.
@@ -1174,6 +1175,14 @@ static int download_partition(struct rkusb *u, uint32_t base_lba,
 	 * split at a non-block-aligned sector count.  Use sector_per_blk
 	 * (from READ_FLASH_INFO fi[4:5]) to convert sector addresses; fall
 	 * back to 256 sectors/block if the value is zero or unavailable.
+	 *
+	 * partition_sectors (from RKAF padded_size) is the full on-flash
+	 * extent of this partition.  We always erase at least this many
+	 * sectors — even if image_size is smaller — to guarantee that tail
+	 * blocks left over from previous flashing attempts are wiped clean.
+	 * UBI wear-levelling can place live journal/index LEBs in those tail
+	 * blocks, so erasing only the image-size range silently leaves stale
+	 * UBI headers behind and causes UBIFS to fail on first mount.
 	 */
 	if (data_len >= 4) {
 		uint32_t magic = (uint32_t)data[0] |
@@ -1182,17 +1191,26 @@ static int download_partition(struct rkusb *u, uint32_t base_lba,
 		                 ((uint32_t)data[3] << 24);
 		if (magic == RKUBI_MAGIC) {
 			uint32_t spb = sector_per_blk ? sector_per_blk : 256;
-			uint32_t sectors =
+			uint32_t img_sectors =
 				(uint32_t)((data_len + RKUSB_SECTOR_BYTES - 1)
 				            / RKUSB_SECTOR_BYTES);
-			/* Round up to a whole number of erase blocks. */
+			/*
+			 * Erase the larger of: the image payload size rounded
+			 * up to whole blocks, or the full partition extent
+			 * (padded_size) rounded up to whole blocks.
+			 */
+			uint32_t erase_sectors =
+				partition_sectors > img_sectors
+				? partition_sectors : img_sectors;
 			uint32_t blocks =
-				(sectors + spb - 1) / spb;
+				(erase_sectors + spb - 1) / spb;
 			uint32_t block_start = base_lba / spb;
 			fprintf(stderr,
 			        "UBI image: erasing %u blocks (%u sectors)"
-			        " at block 0x%x (LBA 0x%08x)\n",
-			        blocks, blocks * spb, block_start, base_lba);
+			        " at block 0x%x (LBA 0x%08x)"
+			        " [img=%u part=%u]\n",
+			        blocks, blocks * spb, block_start, base_lba,
+			        img_sectors, erase_sectors);
 			int rce = rkusb_erase_force(u, block_start, blocks);
 			if (rce < 0) {
 				fprintf(stderr,
@@ -1212,7 +1230,10 @@ static int download_partition(struct rkusb *u, uint32_t base_lba,
 
 	if (rksparse_is_sparse(data, data_len)) {
 		/* Total size is unknown in sparse images without parsing;
-		 * use the compressed length as a progress denominator. */
+		 * use the compressed length as a progress denominator.  The
+		 * dl_write_block callbacks already emit incremental progress;
+		 * do not emit an extra 100% here — that would double-fire the
+		 * completion indicator when the expanded size equals data_len. */
 		ctx.total = data_len;
 		int rc = rksparse_expand(data, data_len, dl_sparse_cb, &ctx);
 		if (rc < 0) {
@@ -1221,16 +1242,23 @@ static int download_partition(struct rkusb *u, uint32_t base_lba,
 			        label, rc);
 			return rc;
 		}
-		progress(label, 1, 1);
+		/* Guarantee the final newline is printed even when the expanded
+		 * size is smaller than the compressed file size (expanded < total
+		 * means dl_write_block never reached 100%). */
+		progress(label, ctx.total, ctx.total);
 		return 0;
 	}
 
-	/* Raw image: full sector-aligned pad-and-write. */
+	/* Raw image: full sector-aligned pad-and-write.
+	 * Update progress after every chunk so the user sees a live
+	 * indicator for large partitions rather than only a final 100%. */
 	size_t total_sectors =
 		(data_len + RKUSB_SECTOR_BYTES - 1) / RKUSB_SECTOR_BYTES;
+	size_t full_bytes = total_sectors * RKUSB_SECTOR_BYTES;
 	uint8_t chunk[RKUSB_MAX_LBA_SECTORS * RKUSB_SECTOR_BYTES];
 	size_t off = 0;
 	uint32_t lba = 0;
+	size_t written_bytes = 0;
 	while (total_sectors) {
 		size_t step = total_sectors > RKUSB_MAX_LBA_SECTORS
 		              ? RKUSB_MAX_LBA_SECTORS : total_sectors;
@@ -1249,8 +1277,195 @@ static int download_partition(struct rkusb *u, uint32_t base_lba,
 		off += copy;
 		lba += (uint32_t)step;
 		total_sectors -= step;
+		written_bytes += want;
+		progress(label, written_bytes, full_bytes);
 	}
-	progress(label, data_len, data_len);
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* validate_partition helpers                                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Context shared between validate_partition and the sparse callback.
+ * Also reused for raw validation (sparse == false, cb not needed).
+ */
+struct val_ctx {
+	struct rkusb *u;
+	uint32_t      base_lba;
+	const char   *vlabel;
+	uint64_t      compared;    /* bytes verified so far     */
+	uint64_t      total;       /* total expanded bytes      */
+	int           rc;          /* first failure, 0 = ok     */
+};
+
+/*
+ * Read `sectors` sectors from flash starting at base_lba+lba_off into
+ * `readback`, then compare them against `expected` (raw bytes for a RAW
+ * chunk) or a repeating `fill_word` pattern (for a FILL chunk).
+ * Updates ctx->compared and emits progress.
+ */
+static int val_compare_sectors(struct val_ctx *ctx, uint32_t lba_off,
+                                const uint8_t *expected, uint32_t sectors,
+                                uint32_t fill_word)
+{
+	uint8_t readback[RKUSB_MAX_LBA_SECTORS * RKUSB_SECTOR_BYTES];
+
+	/* Build the expected fill sector once, if this is a FILL chunk. */
+	uint8_t fill_sec[RKUSB_SECTOR_BYTES];
+	if (!expected) {
+		for (size_t i = 0; i < sizeof(fill_sec); i += 4)
+			memcpy(fill_sec + i, &fill_word, 4);
+	}
+
+	uint32_t done = 0;
+	while (done < sectors) {
+		uint32_t step = sectors - done;
+		if (step > RKUSB_MAX_LBA_SECTORS)
+			step = RKUSB_MAX_LBA_SECTORS;
+		size_t want = (size_t)step * RKUSB_SECTOR_BYTES;
+
+		int rc = rkusb_read_lba(ctx->u,
+		                        ctx->base_lba + lba_off + done,
+		                        (uint16_t)step, readback);
+		if (rc < 0) {
+			fprintf(stderr,
+			        "\nReadLBA failed at LBA 0x%08x during"
+			        " verify of '%s': %d\n",
+			        ctx->base_lba + lba_off + done,
+			        ctx->vlabel, rc);
+			return rc;
+		}
+
+		if (expected) {
+			/* RAW chunk: compare source bytes directly. */
+			const uint8_t *src =
+				expected + (size_t)done * RKUSB_SECTOR_BYTES;
+			if (memcmp(src, readback, want) != 0) {
+				fprintf(stderr,
+				        "\nVerify FAILED for '%s'"
+				        " at LBA 0x%08x\n",
+				        ctx->vlabel,
+				        ctx->base_lba + lba_off + done);
+				return -EIO;
+			}
+		} else {
+			/* FILL chunk: every sector must match fill_sec. */
+			for (uint32_t s = 0; s < step; s++) {
+				if (memcmp(fill_sec,
+				           readback + (size_t)s
+				                      * RKUSB_SECTOR_BYTES,
+				           RKUSB_SECTOR_BYTES) != 0) {
+					fprintf(stderr,
+					        "\nVerify FAILED (fill) for"
+					        " '%s' at LBA 0x%08x\n",
+					        ctx->vlabel,
+					        ctx->base_lba + lba_off
+					        + done + s);
+					return -EIO;
+				}
+			}
+		}
+
+		done           += step;
+		ctx->compared  += want;
+		progress(ctx->vlabel, ctx->compared, ctx->total);
+	}
+	return 0;
+}
+
+/*
+ * rksparse_write_fn callback for validation: instead of writing to flash,
+ * reads the same LBA range back and compares against the expected content.
+ * DON'T CARE chunks are not passed to this callback by rksparse_expand,
+ * so they are correctly left unverified.
+ */
+static int val_sparse_cb(void *user, uint32_t lba, const uint8_t *data,
+                         uint32_t sectors, uint32_t fill_word)
+{
+	struct val_ctx *ctx = user;
+	if (ctx->rc)
+		return ctx->rc;
+	int rc = val_compare_sectors(ctx, lba, data, sectors, fill_word);
+	if (rc < 0)
+		ctx->rc = rc;
+	return rc;
+}
+
+/*
+ * validate_partition — read back every sector written by download_partition
+ * and compare against the original source data.
+ *
+ * For raw (and UBI) images the source bytes are compared directly; the
+ * zero-padding written into the last partial sector is also verified.
+ *
+ * For sparse images rksparse_expand() is re-run with a read-and-compare
+ * callback instead of a write callback, so RAW and FILL chunks are both
+ * verified against flash.  DON'T CARE regions are intentionally skipped.
+ *
+ * Shows "Validating <label> … X%" progress while reading.
+ * Returns 0 on success, -EIO on mismatch, or a negative libusb error.
+ */
+static int validate_partition(struct rkusb *u, uint32_t base_lba,
+                               const uint8_t *data, size_t data_len,
+                               const char *label)
+{
+	char vlabel[80];
+	snprintf(vlabel, sizeof(vlabel), "Validating %s", label);
+
+	/* ---- Sparse image path ---------------------------------------- */
+	if (rksparse_is_sparse(data, data_len)) {
+		struct val_ctx ctx = {
+			.u        = u,
+			.base_lba = base_lba,
+			.vlabel   = vlabel,
+			.total    = rksparse_total_bytes(data, data_len),
+			.rc       = 0,
+		};
+		int rc = rksparse_expand(data, data_len, val_sparse_cb, &ctx);
+		return rc ? rc : ctx.rc;
+	}
+
+	/* ---- Raw / UBI image path ------------------------------------- */
+	uint32_t total_sectors =
+		(uint32_t)((data_len + RKUSB_SECTOR_BYTES - 1)
+		            / RKUSB_SECTOR_BYTES);
+	uint64_t full_bytes = (uint64_t)total_sectors * RKUSB_SECTOR_BYTES;
+
+	struct val_ctx ctx = {
+		.u        = u,
+		.base_lba = base_lba,
+		.vlabel   = vlabel,
+		.total    = full_bytes,
+		.rc       = 0,
+	};
+
+	size_t data_off = 0;
+	uint32_t remaining = total_sectors;
+	uint32_t lba_off   = 0;
+
+	while (remaining) {
+		uint32_t step = remaining > RKUSB_MAX_LBA_SECTORS
+		                ? RKUSB_MAX_LBA_SECTORS : remaining;
+		size_t want = (size_t)step * RKUSB_SECTOR_BYTES;
+
+		/* Build the sector-aligned expected buffer (zero-padded). */
+		uint8_t expected[RKUSB_MAX_LBA_SECTORS * RKUSB_SECTOR_BYTES];
+		memset(expected, 0, want);
+		size_t avail = data_len - data_off;
+		size_t copy  = avail < want ? avail : want;
+		memcpy(expected, data + data_off, copy);
+
+		int rc = val_compare_sectors(&ctx, lba_off, expected,
+		                             step, 0);
+		if (rc < 0)
+			return rc;
+
+		data_off  += copy;
+		lba_off   += step;
+		remaining -= step;
+	}
 	return 0;
 }
 
@@ -1336,6 +1551,22 @@ static int cmd_upgrade_firmware(int argc, char **argv)
 		        fi[0], fi[1], sector_per_blk);
 	}
 
+	/* Dump the full RKAF partition table for diagnostics. */
+	fprintf(stderr, "\nRKAF partition table (%u entries):\n",
+	        f.image.hdr->num_parts);
+	fprintf(stderr, "  %-20s  %-12s  %-12s  %-12s  %s\n",
+	        "name", "LBA(hex)", "img_bytes", "part_sectors", "part_bytes");
+	for (uint32_t i = 0; i < f.image.hdr->num_parts && i < 16; ++i) {
+		const struct rkaf_part *p2 = &f.image.hdr->parts[i];
+		if (p2->image_size == 0 && p2->padded_size == 0)
+			continue;
+		fprintf(stderr, "  %-20.32s  0x%08x    %-12u  %-12u  %llu\n",
+		        p2->name, p2->nand_addr, p2->image_size,
+		        p2->padded_size,
+		        (unsigned long long)p2->padded_size * 512);
+	}
+	fprintf(stderr, "\n");
+
 	/* Walk every partition and write it. */
 	for (uint32_t i = 0;
 	     i < f.image.hdr->num_parts && i < 16;
@@ -1368,10 +1599,14 @@ static int cmd_upgrade_firmware(int argc, char **argv)
 		uint32_t base = p->nand_addr;
 		if (strncmp(p->name, "parameter", sizeof(p->name)) == 0)
 			base = 0;
-		fprintf(stderr, "\nPartition %-12.32s @ LBA 0x%08x (%zu B)\n",
-		        p->name, base, len);
+		fprintf(stderr,
+		        "\nPartition %-12.32s @ LBA 0x%08x"
+		        " img=%zu B  part=%u sectors\n",
+		        p->name, base, len, p->padded_size);
 		rc = download_partition(&u, base, buf, len, p->name,
-		                        sector_per_blk);
+		                        sector_per_blk, p->padded_size);
+		if (rc == 0)
+			rc = validate_partition(&u, base, buf, len, p->name);
 		free(buf);
 		if (rc < 0)
 			goto out;
@@ -1497,7 +1732,10 @@ static int cmd_download_image(int argc, char **argv)
 		}
 	} else {
 		rc = download_partition(&u, base_lba, buf, (size_t)size,
-		                        part_name, 0);
+		                        part_name, 0, 0);
+		if (rc == 0)
+			rc = validate_partition(&u, base_lba, buf, (size_t)size,
+			                        part_name);
 	}
 
 	rkusb_close(&u);
@@ -1805,7 +2043,10 @@ static int cmd_write_lba_named(int argc, char **argv)
 	fprintf(stderr, "WLX: partition '%s' @ LBA 0x%" PRIx64 "\n",
 	        part_name, first_lba);
 	rc = download_partition(&u, (uint32_t)first_lba, buf, (size_t)size,
-	                        part_name, 0);
+	                        part_name, 0, 0);
+	if (rc == 0)
+		rc = validate_partition(&u, (uint32_t)first_lba, buf,
+		                        (size_t)size, part_name);
 	rkusb_close(&u);
 	free(buf);
 	return rc ? 1 : 0;
