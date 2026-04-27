@@ -1521,7 +1521,8 @@ static int cmd_upgrade_firmware(int argc, char **argv)
 	 * to finish its internal flash controller initialisation.
 	 */
 	fprintf(stderr, "Get FlashInfo Start\n");
-	uint32_t sector_per_blk = 256; /* safe default for SPI-NAND */
+	uint32_t sector_per_blk    = 256; /* safe default for SPI-NAND    */
+	uint32_t total_flash_sects = 0;   /* total LBA sectors on device  */
 	{
 		uint8_t fi[11] = {0};
 		bool fi_ok = false;
@@ -1543,27 +1544,77 @@ static int cmd_upgrade_firmware(int argc, char **argv)
 			        libusb_error_name(rc), rc);
 			goto out;
 		}
-		sector_per_blk = rkusb_flash_info_sector_per_blk(fi);
+		sector_per_blk    = rkusb_flash_info_sector_per_blk(fi);
+		total_flash_sects = (uint32_t)fi[0]
+		                  | ((uint32_t)fi[1] << 8)
+		                  | ((uint32_t)fi[2] << 16)
+		                  | ((uint32_t)fi[3] << 24);
 		fprintf(stderr,
 		        "Get FlashInfo Success"
 		        " — mfr=0x%02x type=0x%02x"
-		        " sec/blk=%u\n",
-		        fi[0], fi[1], sector_per_blk);
+		        " sec/blk=%u  total_sects=%u\n",
+		        fi[0], fi[1], sector_per_blk, total_flash_sects);
 	}
 
-	/* Dump the full RKAF partition table for diagnostics. */
+	/*
+	 * Build a sorted list of all valid (non-meta) flash LBA addresses so
+	 * we can compute each partition's actual on-flash extent as
+	 * (next_partition_lba - this_lba).  The last partition's extent
+	 * reaches total_flash_sects.  This is essential for UBI partitions:
+	 * padded_size in the RKAF header is stored in NAND pages (not 512-byte
+	 * sectors) and equals image_size / page_size, so it does NOT reflect
+	 * the full on-flash allocation.  Without the correct extent, ERASE_FORCE
+	 * only covers the image payload and leaves stale UBI headers in the
+	 * tail blocks from previous flashing runs.  UBI then sees those stale
+	 * headers as "good PEBs" and adds them to the volume, causing UBIFS to
+	 * map journal LEBs to wrong physical blocks and fail to mount.
+	 */
+	uint32_t sorted_lbas[16];
+	uint32_t n_sorted = 0;
+	for (uint32_t i = 0; i < f.image.hdr->num_parts && i < 16; ++i) {
+		const struct rkaf_part *p2 = &f.image.hdr->parts[i];
+		if (p2->nand_addr == 0xffffffffu || p2->image_size == 0)
+			continue;
+		uint32_t lba = (strncmp(p2->name, "parameter",
+		                        sizeof(p2->name)) == 0)
+		               ? 0 : p2->nand_addr;
+		/* Insertion-sort into sorted_lbas (max 16 entries). */
+		uint32_t j = n_sorted;
+		while (j > 0 && sorted_lbas[j - 1] > lba) {
+			sorted_lbas[j] = sorted_lbas[j - 1];
+			--j;
+		}
+		sorted_lbas[j] = lba;
+		++n_sorted;
+	}
+
+	/* Dump the full RKAF partition table with computed extents. */
 	fprintf(stderr, "\nRKAF partition table (%u entries):\n",
 	        f.image.hdr->num_parts);
-	fprintf(stderr, "  %-20s  %-12s  %-12s  %-12s  %s\n",
-	        "name", "LBA(hex)", "img_bytes", "part_sectors", "part_bytes");
+	fprintf(stderr, "  %-20s  %-10s  %-12s  %-12s\n",
+	        "name", "LBA(hex)", "img_bytes", "erase_sects");
 	for (uint32_t i = 0; i < f.image.hdr->num_parts && i < 16; ++i) {
 		const struct rkaf_part *p2 = &f.image.hdr->parts[i];
 		if (p2->image_size == 0 && p2->padded_size == 0)
 			continue;
-		fprintf(stderr, "  %-20.32s  0x%08x    %-12u  %-12u  %llu\n",
-		        p2->name, p2->nand_addr, p2->image_size,
-		        p2->padded_size,
-		        (unsigned long long)p2->padded_size * 512);
+		if (p2->nand_addr == 0xffffffffu) {
+			fprintf(stderr, "  %-20.32s  (meta)\n", p2->name);
+			continue;
+		}
+		uint32_t base2 = (strncmp(p2->name, "parameter",
+		                           sizeof(p2->name)) == 0)
+		                  ? 0 : p2->nand_addr;
+		/* Find next higher LBA in sorted list. */
+		uint32_t ext = total_flash_sects > base2
+		               ? total_flash_sects - base2 : 0;
+		for (uint32_t k = 0; k < n_sorted; ++k) {
+			if (sorted_lbas[k] > base2) {
+				ext = sorted_lbas[k] - base2;
+				break;
+			}
+		}
+		fprintf(stderr, "  %-20.32s  0x%08x  %-12u  %u\n",
+		        p2->name, base2, p2->image_size, ext);
 	}
 	fprintf(stderr, "\n");
 
@@ -1599,12 +1650,28 @@ static int cmd_upgrade_firmware(int argc, char **argv)
 		uint32_t base = p->nand_addr;
 		if (strncmp(p->name, "parameter", sizeof(p->name)) == 0)
 			base = 0;
+
+		/*
+		 * Compute the actual on-flash partition extent: find the
+		 * next higher LBA in the sorted list; for the last partition
+		 * use total_flash_sects.  This is used by download_partition
+		 * to determine how many UBI blocks to erase.
+		 */
+		uint32_t part_sects = total_flash_sects > base
+		                      ? total_flash_sects - base : 0;
+		for (uint32_t k = 0; k < n_sorted; ++k) {
+			if (sorted_lbas[k] > base) {
+				part_sects = sorted_lbas[k] - base;
+				break;
+			}
+		}
+
 		fprintf(stderr,
 		        "\nPartition %-12.32s @ LBA 0x%08x"
-		        " img=%zu B  part=%u sectors\n",
-		        p->name, base, len, p->padded_size);
+		        " img=%zu B  extent=%u sectors\n",
+		        p->name, base, len, part_sects);
 		rc = download_partition(&u, base, buf, len, p->name,
-		                        sector_per_blk, p->padded_size);
+		                        sector_per_blk, part_sects);
 		if (rc == 0)
 			rc = validate_partition(&u, base, buf, len, p->name);
 		free(buf);
