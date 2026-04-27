@@ -364,7 +364,7 @@ class SocketRockusbEmulator:
             EMU_BULK_IN:    self._h_bulk_in,
             EMU_CTRL_OUT:   self._h_ctrl_out,
             EMU_CTRL_IN:    self._h_ctrl_in,
-            EMU_CLEAR_HALT: lambda p: (0, b""),
+            EMU_CLEAR_HALT: self._h_clear_halt,
         }
         fn = handlers.get(msg_type)
         if fn is None:
@@ -428,6 +428,12 @@ class SocketRockusbEmulator:
         return 0, b""
 
     def _h_release(self, payload: bytes):
+        return 0, b""
+
+    def _h_clear_halt(self, payload: bytes):
+        endpoint = payload[1] if len(payload) >= 2 else 0
+        self.oplog.write({"op": "CLEAR_HALT", "endpoint": endpoint})
+        log.debug("CLEAR_HALT endpoint=0x%02x", endpoint)
         return 0, b""
 
     def _h_bulk_out(self, payload: bytes):
@@ -654,8 +660,13 @@ class SocketRockusbEmulator:
             addr = struct.unpack_from(">I", cdb, 2)[0] if len(cdb) >= 6 else 0
             length = struct.unpack_from(">H", cdb, 7)[0] if len(cdb) >= 9 else cbw["data_length"]
             self.oplog.write({"op": "READ_SDRAM", "addr": addr, "len": length})
-            # Return seeded pattern: byte = (addr + offset) & 0xFF
-            data_out = bytes((addr + i) & 0xFF for i in range(length))
+            # Return stored data if it was previously written, otherwise fall
+            # back to the seeded pattern so existing DUMP-only tests still pass.
+            stored = self.sdram.get(addr)
+            if stored is not None and len(stored) >= length:
+                data_out = bytes(stored[:length])
+            else:
+                data_out = bytes((addr + i) & 0xFF for i in range(length))
             return data_out, CSW_OK
 
         if op == RKOP_WRITE_SDRAM:
