@@ -259,6 +259,29 @@ int rkusb_write_lba(struct rkusb *u, uint32_t lba, uint16_t sectors,
                     const uint8_t *buf);
 int rkusb_erase_lba(struct rkusb *u, uint32_t lba, uint32_t sectors);
 
+/*
+ * rkusb_erase_force – erase flash by native NAND block number.
+ *
+ * block_start and block_count are in units of one NAND erase block.
+ * Use rkusb_flash_info_sector_per_blk() to convert a sector LBA and
+ * sector count to block units.  Sends at most RKUSB_ERASE_FORCE_MAX_BLOCKS
+ * blocks per CBW.
+ */
+#define RKUSB_ERASE_FORCE_MAX_BLOCKS 16
+int rkusb_erase_force(struct rkusb *u, uint32_t block_start,
+                      uint32_t block_count);
+
+/*
+ * rkusb_flash_info_sector_per_blk – extract sectors-per-block from a raw
+ * READ_FLASH_INFO response buffer (11 bytes).  Returns 256 as a safe
+ * default when the value cannot be determined.
+ */
+static inline uint32_t rkusb_flash_info_sector_per_blk(const uint8_t fi[11])
+{
+	uint32_t spb = (uint32_t)fi[4] | ((uint32_t)fi[5] << 8);
+	return spb ? spb : 256;
+}
+
 int rkusb_read_sdram(struct rkusb *u, uint32_t addr, uint8_t *buf,
                      uint32_t len);
 int rkusb_write_sdram(struct rkusb *u, uint32_t addr, const uint8_t *buf,

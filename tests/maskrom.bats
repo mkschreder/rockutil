@@ -168,6 +168,31 @@ PYEOF
     _restart_maskrom
 }
 
+@test "UF firmware.img uses ERASE_FORCE (not ERASE_LBA) for rootfs UBI partition" {
+    # The firmware.img fixture contains a 'rootfs' partition at LBA 0x4000
+    # with UBI magic.  The UF path must issue ERASE_FORCE (block-level erase)
+    # instead of ERASE_LBA to avoid the non-block-aligned split boundary bug.
+    # Emulator reports sector_per_blk=128; LBA 0x4000 / 128 = 0x80 = 128.
+    run run_tool UF "$FIXTURE_DIR/firmware.img"
+    [ "$status" -eq 0 ]
+
+    # ERASE_FORCE must appear for the rootfs UBI partition
+    oplog_has_op "ERASE_FORCE"
+    oplog_has_op "ERASE_FORCE" "block" "128"
+
+    # ERASE_LBA must NOT be emitted for UBI partitions
+    local cnt
+    cnt=$(oplog_count "ERASE_LBA")
+    [ "$cnt" -eq 0 ]
+
+    # rootfs data must still be present after the erase+write
+    local out="$BATS_TEST_TMPDIR/rootfs_readback.bin"
+    run run_tool RL 0x4000 8 "$out"
+    [ "$status" -eq 0 ]
+
+    _restart_maskrom
+}
+
 # =========================================================================
 # DI — download image
 # =========================================================================

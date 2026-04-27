@@ -64,6 +64,7 @@ CSW_FAIL = 1
 
 RKOP_TEST_UNIT_READY  = 0x00
 RKOP_READ_FLASH_ID    = 0x01
+RKOP_ERASE_FORCE      = 0x0B
 RKOP_READ_LBA         = 0x14
 RKOP_WRITE_LBA        = 0x15
 RKOP_READ_FLASH_INFO  = 0x1A
@@ -80,8 +81,10 @@ RKOP_READ_CAPABILITY  = 0xAA
 RKOP_DEVICE_RESET     = 0xFF
 RKOP_WRITE_LOADER     = 0x57
 
-SECTOR_SIZE   = 512
-FLASH_SECTORS = 131072  # 64 MiB
+SECTOR_SIZE        = 512
+FLASH_SECTORS      = 131072  # 64 MiB
+# Sectors per erase block — must match the value in FLASH_INFO_RESPONSE fi[4:5].
+SECTORS_PER_BLOCK  = 128
 
 RKUSB_CTRL_DDR_INIT = 0x0471
 RKUSB_CTRL_LOADER   = 0x0472
@@ -613,6 +616,18 @@ class SocketRockusbEmulator:
             lba     = struct.unpack_from(">I", cdb, 2)[0] if len(cdb) >= 6 else 0
             sectors = struct.unpack_from(">H", cdb, 7)[0] if len(cdb) >= 9 else 1
             self.oplog.write({"op": "ERASE_LBA", "lba": lba, "sectors": sectors})
+            self._flash_erase(lba, sectors)
+            return b"", CSW_OK
+
+        if op == RKOP_ERASE_FORCE:
+            # CDB layout mirrors ERASE_LBA but in NAND erase-block units:
+            #   [2:6] start block (big-endian), [7:9] block count (big-endian).
+            block_start = struct.unpack_from(">I", cdb, 2)[0] if len(cdb) >= 6 else 0
+            block_count = struct.unpack_from(">H", cdb, 7)[0] if len(cdb) >= 9 else 1
+            lba     = block_start * SECTORS_PER_BLOCK
+            sectors = block_count  * SECTORS_PER_BLOCK
+            self.oplog.write({"op": "ERASE_FORCE",
+                              "block": block_start, "count": block_count})
             self._flash_erase(lba, sectors)
             return b"", CSW_OK
 

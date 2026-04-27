@@ -692,8 +692,11 @@ static void init_cbw(struct cbw *cbw, uint8_t opcode, uint32_t data_len)
 	cbw->data_length = data_len;
 	cbw->lun         = 0;
 
-	if (opcode == RKOP_READ_CAPABILITY || opcode == RKOP_DEVICE_RESET) {
-		cbw->flags      = 0x80;
+	if (opcode == RKOP_READ_CAPABILITY) {
+		cbw->flags      = 0x80;   /* IN: device sends 8 bytes */
+		cbw->cdb_length = 6;
+	} else if (opcode == RKOP_DEVICE_RESET) {
+		cbw->flags      = 0x00;   /* no data transfer */
 		cbw->cdb_length = 6;
 	} else if (opcode < sizeof(OP_TABLE) / sizeof(OP_TABLE[0]) &&
 	           OP_TABLE[opcode].cdb_len) {
@@ -932,15 +935,66 @@ int rkusb_write_lba(struct rkusb *u, uint32_t lba, uint16_t sectors,
 
 int rkusb_erase_lba(struct rkusb *u, uint32_t lba, uint32_t sectors)
 {
-	struct cbw cbw;
-	init_cbw(&cbw, RKOP_ERASE_LBA, 0);
-	cbw.cdb[2] = (uint8_t)(lba >> 24);
-	cbw.cdb[3] = (uint8_t)(lba >> 16);
-	cbw.cdb[4] = (uint8_t)(lba >> 8);
-	cbw.cdb[5] = (uint8_t)lba;
-	cbw.cdb[7] = (uint8_t)(sectors >> 8);
-	cbw.cdb[8] = (uint8_t)sectors;
-	return cbw_exec(u, &cbw, NULL, 0);
+	/*
+	 * The ERASE_LBA CDB encodes the sector count in bytes [7:8] — a
+	 * 16-bit big-endian field (max 65535 sectors per command).  Large
+	 * partitions such as rootfs (99072 sectors = 0x18300) overflow this
+	 * field: without splitting, only the lower 16 bits would be sent
+	 * (33536 sectors = 0x8300), leaving 65536 sectors un-erased before
+	 * the subsequent WriteLBA pass and silently corrupting the UBI
+	 * filesystem.  Split into multiple commands of at most 0xFFFF
+	 * sectors each.
+	 */
+	while (sectors > 0) {
+		uint32_t step = sectors > 0xFFFF ? 0xFFFF : sectors;
+		struct cbw cbw;
+		init_cbw(&cbw, RKOP_ERASE_LBA, 0);
+		cbw.cdb[2] = (uint8_t)(lba >> 24);
+		cbw.cdb[3] = (uint8_t)(lba >> 16);
+		cbw.cdb[4] = (uint8_t)(lba >> 8);
+		cbw.cdb[5] = (uint8_t)lba;
+		cbw.cdb[7] = (uint8_t)(step >> 8);
+		cbw.cdb[8] = (uint8_t)step;
+		int rc = cbw_exec(u, &cbw, NULL, 0);
+		if (rc < 0)
+			return rc;
+		lba += step;
+		sectors -= step;
+	}
+	return 0;
+}
+
+int rkusb_erase_force(struct rkusb *u, uint32_t block_start,
+                      uint32_t block_count)
+{
+	/*
+	 * ERASE_FORCE (0x0b) erases NAND flash at the native erase-block
+	 * granularity.  The CDB encodes the start block number and count in
+	 * the same layout as ERASE_LBA, but the unit is one NAND erase block
+	 * (typically 256 sectors = 128 KB on SPI-NAND).
+	 *
+	 * Firmware implementations cap the per-command block count at 16
+	 * (matching observed reference-tool behaviour); split larger requests
+	 * accordingly.
+	 */
+	while (block_count > 0) {
+		uint32_t step = block_count > RKUSB_ERASE_FORCE_MAX_BLOCKS
+		                ? RKUSB_ERASE_FORCE_MAX_BLOCKS : block_count;
+		struct cbw cbw;
+		init_cbw(&cbw, RKOP_ERASE_FORCE, 0);
+		cbw.cdb[2] = (uint8_t)(block_start >> 24);
+		cbw.cdb[3] = (uint8_t)(block_start >> 16);
+		cbw.cdb[4] = (uint8_t)(block_start >> 8);
+		cbw.cdb[5] = (uint8_t)block_start;
+		cbw.cdb[7] = (uint8_t)(step >> 8);
+		cbw.cdb[8] = (uint8_t)step;
+		int rc = cbw_exec(u, &cbw, NULL, 0);
+		if (rc < 0)
+			return rc;
+		block_start += step;
+		block_count -= step;
+	}
+	return 0;
 }
 
 int rkusb_write_sdram(struct rkusb *u, uint32_t addr,

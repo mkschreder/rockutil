@@ -394,16 +394,21 @@ def main(out_dir: str) -> None:
     print("  zero_byte.bin written")
 
     # -----------------------------------------------------------------------
-    # RKAF — two partitions
+    # RKAF — three partitions
     #   parameter @ LBA 0        (nand_addr=0)
     #   misc      @ LBA 0x2000   (8 MiB into the 64 MiB emulated flash)
+    #   rootfs    @ LBA 0x4000   (UBI image — triggers block-erase before write)
     # -----------------------------------------------------------------------
     param_data = PARAMETER_TXT.encode()
     misc_data = b"\xdd" * 4096
 
+    ubi_magic = struct.pack("<I", 0x23494255)  # 'U','B','I','#' as LE u32
+    rootfs_data = ubi_magic + b"\xee" * (4096 - len(ubi_magic))
+
     rkaf_blob = build_rkaf([
-        {"name": "parameter", "nand_addr": 0,      "data": param_data},
+        {"name": "parameter", "nand_addr": 0,       "data": param_data},
         {"name": "misc",      "nand_addr": 0x2000,  "data": misc_data},
+        {"name": "rootfs",    "nand_addr": 0x4000,  "data": rootfs_data},
     ])
     print(f"  rkaf (internal): {len(rkaf_blob)} bytes")
 

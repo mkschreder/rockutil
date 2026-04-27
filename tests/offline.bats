@@ -86,9 +86,10 @@ FIXTURE_DIR="${FIXTURE_DIR:-tests/build/fixtures}"
     run "$TOOL" PRINT "$FIXTURE_DIR/firmware.img"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "RKAF header" ]]
-    [[ "$output" =~ "partitions  : 2" ]]
+    [[ "$output" =~ "partitions  : 3" ]]
     [[ "$output" =~ "parameter" ]]
     [[ "$output" =~ "misc" ]]
+    [[ "$output" =~ "rootfs" ]]
 }
 
 @test "PRINT loader.bin shows standalone RKBOOT" {

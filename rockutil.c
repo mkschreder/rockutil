@@ -1162,12 +1162,18 @@ static int dl_sparse_cb(void *user, uint32_t lba, const uint8_t *data,
 
 static int download_partition(struct rkusb *u, uint32_t base_lba,
                               const uint8_t *data, size_t data_len,
-                              const char *label)
+                              const char *label, uint32_t sector_per_blk)
 {
 	/*
-	 * UBI images must be written to erased flash.  Detect the UBI
-	 * volume magic (stored as LE u32 at offset 0) and erase the
-	 * target partition region before writing.
+	 * UBI images must be written to cleanly erased NAND blocks.
+	 * Detect the UBI volume magic (LE u32 at offset 0) and erase the
+	 * target region using ERASE_FORCE (block-level erase).
+	 *
+	 * ERASE_FORCE operates in native NAND erase-block units, avoiding
+	 * the partial-block boundary problem that arises when ERASE_LBA is
+	 * split at a non-block-aligned sector count.  Use sector_per_blk
+	 * (from READ_FLASH_INFO fi[4:5]) to convert sector addresses; fall
+	 * back to 256 sectors/block if the value is zero or unavailable.
 	 */
 	if (data_len >= 4) {
 		uint32_t magic = (uint32_t)data[0] |
@@ -1175,16 +1181,23 @@ static int download_partition(struct rkusb *u, uint32_t base_lba,
 		                 ((uint32_t)data[2] << 16) |
 		                 ((uint32_t)data[3] << 24);
 		if (magic == RKUBI_MAGIC) {
-			uint32_t erase_count =
+			uint32_t spb = sector_per_blk ? sector_per_blk : 256;
+			uint32_t sectors =
 				(uint32_t)((data_len + RKUSB_SECTOR_BYTES - 1)
 				            / RKUSB_SECTOR_BYTES);
+			/* Round up to a whole number of erase blocks. */
+			uint32_t blocks =
+				(sectors + spb - 1) / spb;
+			uint32_t block_start = base_lba / spb;
 			fprintf(stderr,
-			        "UBI image: erasing %u sectors at LBA 0x%08x\n",
-			        erase_count, base_lba);
-			int rce = rkusb_erase_lba(u, base_lba, erase_count);
+			        "UBI image: erasing %u blocks (%u sectors)"
+			        " at block 0x%x (LBA 0x%08x)\n",
+			        blocks, blocks * spb, block_start, base_lba);
+			int rce = rkusb_erase_force(u, block_start, blocks);
 			if (rce < 0) {
 				fprintf(stderr,
-				        "erase before UBI write failed: %d\n", rce);
+				        "erase before UBI write failed: %d\n",
+				        rce);
 				return rce;
 			}
 		}
@@ -1236,7 +1249,6 @@ static int download_partition(struct rkusb *u, uint32_t base_lba,
 		off += copy;
 		lba += (uint32_t)step;
 		total_sectors -= step;
-		progress(label, off, data_len);
 	}
 	progress(label, data_len, data_len);
 	return 0;
@@ -1294,6 +1306,7 @@ static int cmd_upgrade_firmware(int argc, char **argv)
 	 * to finish its internal flash controller initialisation.
 	 */
 	fprintf(stderr, "Get FlashInfo Start\n");
+	uint32_t sector_per_blk = 256; /* safe default for SPI-NAND */
 	{
 		uint8_t fi[11] = {0};
 		bool fi_ok = false;
@@ -1315,13 +1328,12 @@ static int cmd_upgrade_firmware(int argc, char **argv)
 			        libusb_error_name(rc), rc);
 			goto out;
 		}
+		sector_per_blk = rkusb_flash_info_sector_per_blk(fi);
 		fprintf(stderr,
 		        "Get FlashInfo Success"
 		        " — mfr=0x%02x type=0x%02x"
-		        " blk=%u pg/blk=%u\n",
-		        fi[0], fi[1],
-		        (unsigned)fi[3] | ((unsigned)fi[4] << 8),
-		        (unsigned)fi[5]);
+		        " sec/blk=%u\n",
+		        fi[0], fi[1], sector_per_blk);
 	}
 
 	/* Walk every partition and write it. */
@@ -1358,7 +1370,8 @@ static int cmd_upgrade_firmware(int argc, char **argv)
 			base = 0;
 		fprintf(stderr, "\nPartition %-12.32s @ LBA 0x%08x (%zu B)\n",
 		        p->name, base, len);
-		rc = download_partition(&u, base, buf, len, p->name);
+		rc = download_partition(&u, base, buf, len, p->name,
+		                        sector_per_blk);
 		free(buf);
 		if (rc < 0)
 			goto out;
@@ -1484,7 +1497,7 @@ static int cmd_download_image(int argc, char **argv)
 		}
 	} else {
 		rc = download_partition(&u, base_lba, buf, (size_t)size,
-		                        part_name);
+		                        part_name, 0);
 	}
 
 	rkusb_close(&u);
@@ -1792,7 +1805,7 @@ static int cmd_write_lba_named(int argc, char **argv)
 	fprintf(stderr, "WLX: partition '%s' @ LBA 0x%" PRIx64 "\n",
 	        part_name, first_lba);
 	rc = download_partition(&u, (uint32_t)first_lba, buf, (size_t)size,
-	                        part_name);
+	                        part_name, 0);
 	rkusb_close(&u);
 	free(buf);
 	return rc ? 1 : 0;

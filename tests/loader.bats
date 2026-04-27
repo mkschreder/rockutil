@@ -281,6 +281,46 @@ setup() {
     [ "$zeroes" -eq 0 ]
 }
 
+@test "EL with >65535 sectors splits into two ERASE_LBA CBWs (16-bit overflow fix)" {
+    # 99072 sectors = 0x18300.  Without the loop fix the lower 16 bits (0x8300 =
+    # 33536) would be sent in a single CBW, silently under-erasing the flash.
+    # With the fix we expect two CBWs: first 65535 sectors, then 33537 sectors.
+    : > "${OPLOG_FILE}"
+
+    run run_tool EL 0x000 99072
+    [ "$status" -eq 0 ]
+
+    local cnt
+    cnt=$(oplog_count "ERASE_LBA")
+    [ "$cnt" -eq 2 ]
+
+    # First CBW: 65535 sectors (max per command)
+    oplog_has_op "ERASE_LBA" "sectors" "65535"
+    # Second CBW: remainder 99072 - 65535 = 33537
+    oplog_has_op "ERASE_LBA" "sectors" "33537"
+}
+
+@test "EL with exactly 65535 sectors uses a single CBW" {
+    : > "${OPLOG_FILE}"
+    run run_tool EL 0x000 65535
+    [ "$status" -eq 0 ]
+    local cnt
+    cnt=$(oplog_count "ERASE_LBA")
+    [ "$cnt" -eq 1 ]
+    oplog_has_op "ERASE_LBA" "sectors" "65535"
+}
+
+@test "EL with 65536 sectors splits into two CBWs (65535 + 1)" {
+    : > "${OPLOG_FILE}"
+    run run_tool EL 0x000 65536
+    [ "$status" -eq 0 ]
+    local cnt
+    cnt=$(oplog_count "ERASE_LBA")
+    [ "$cnt" -eq 2 ]
+    oplog_has_op "ERASE_LBA" "sectors" "65535"
+    oplog_has_op "ERASE_LBA" "sectors" "1"
+}
+
 # =========================================================================
 # SS — switch storage
 # =========================================================================
@@ -588,12 +628,17 @@ setup() {
 # DI with UBI image
 # =========================================================================
 
-@test "DI with UBI image logs ERASE_LBA before WRITE_LBA" {
+@test "DI with UBI image logs ERASE_FORCE (not ERASE_LBA) before WRITE_LBA" {
     run run_tool DI misc "${FIXTURE_DIR}/ubi_4k.img" \
         "${FIXTURE_DIR}/parameter.txt"
     [ "$status" -eq 0 ]
-    oplog_has_op "ERASE_LBA"
+    # UBI images must use block-level ERASE_FORCE, not sector-level ERASE_LBA
+    oplog_has_op "ERASE_FORCE"
     oplog_has_op "WRITE_LBA"
+    # ERASE_LBA must NOT be emitted for UBI images
+    local cnt
+    cnt=$(oplog_count "ERASE_LBA")
+    [ "$cnt" -eq 0 ]
 }
 
 # =========================================================================
