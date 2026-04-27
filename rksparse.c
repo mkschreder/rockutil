@@ -1,6 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0-only
- * Copyright (C) 2024 rockutil contributors
- */
 /*
  * rksparse.c - Android sparse image expansion used while flashing
  * Rockchip partitions.  Supports v1.0 with chunk types: RAW, FILL,
@@ -43,6 +40,14 @@ bool rksparse_is_sparse(const void *buf, size_t len)
 		return false;
 	const struct sparse_header *h = buf;
 	return h->magic == RKSPARSE_MAGIC;
+}
+
+uint64_t rksparse_total_bytes(const void *buf, size_t len)
+{
+	if (!rksparse_is_sparse(buf, len))
+		return 0;
+	const struct sparse_header *h = buf;
+	return (uint64_t)h->blk_sz * h->total_blks;
 }
 
 int rksparse_expand(const void *buf, size_t len,

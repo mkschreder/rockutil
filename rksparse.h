@@ -1,6 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0-only
- * Copyright (C) 2024 rockutil contributors
- */
 /*
  * rksparse.h - minimal Android sparse-image decoder.  rockutil
  * detects sparse images (magic 0xed26ff3a) in RKAF partitions and
@@ -23,6 +20,13 @@ extern "C" {
 
 /* Tells whether `buf` starts with a sparse header. */
 bool rksparse_is_sparse(const void *buf, size_t len);
+
+/*
+ * Returns the total number of bytes the sparse image expands to
+ * (blk_sz × total_blks).  Returns 0 if the buffer is not a valid
+ * sparse image.
+ */
+uint64_t rksparse_total_bytes(const void *buf, size_t len);
 
 /*
  * Walks the sparse image and calls `write_cb(user, lba, data, sectors)`
