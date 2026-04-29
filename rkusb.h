@@ -326,6 +326,29 @@ int rkusb_ctrl_download(struct rkusb *u, uint16_t req_code,
                         const uint8_t *payload, size_t payload_len);
 
 /*
+ * MaskROM bootrom / memory dump via UART-output payload injection.
+ *
+ * Uploads a small ARM32 or ARM64 stub through the 0x471 MaskROM control
+ * transfer.  The stub runs immediately on the target CPU, reads `len`
+ * bytes from `addr`, and prints them as hex through the UART whose MMIO
+ * base is `uart`.  Nothing is returned over USB — connect a serial
+ * adapter to the target's debug UART to capture the output.
+ *
+ * Set rc4_on=1 to RC4-encrypt the payload before uploading (most RK3xxx
+ * SoCs require this unless the ROM has RC4 disabled via eFuse).
+ *
+ * Typical usage (RV1106, bootrom at 0xffff0000):
+ *   rkusb_maskrom_dump_arm32(&u, 0xff4c0000, 0xffff0000, 1024, 0);
+ *
+ * Typical usage (RK1808 / RK3399 ARM64):
+ *   rkusb_maskrom_dump_arm64(&u, 0xff550000, 0xffff0000, 1024, 1);
+ */
+int rkusb_maskrom_dump_arm32(struct rkusb *u, uint32_t uart,
+                              uint32_t addr, uint32_t len, int rc4_on);
+int rkusb_maskrom_dump_arm64(struct rkusb *u, uint32_t uart,
+                              uint32_t addr, uint32_t len, int rc4_on);
+
+/*
  * Probe the device mode.  Many newer Rockchip chips ship PIDs that
  * aren't in our static table, so we can't rely on enumeration alone.
  * This sends TestUnitReady + ReadFlashInfo in Loader-supported form:

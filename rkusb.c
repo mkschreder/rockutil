@@ -12,6 +12,9 @@
 #endif
 #include "rkusb.h"
 #include "rkcrc.h"
+#include "rkrc4.h"
+#include "payloads/dump_arm32.h"
+#include "payloads/dump_arm64.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -1201,4 +1204,91 @@ int rkusb_probe_loader(struct rkusb *u)
 		return 0; /* MaskROM or wedged loader */
 	}
 	return 1; /* loader confirmed */
+}
+
+/* ------------------------------------------------------------------ */
+/* MaskROM bootrom / memory dump via UART-output payload injection     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Write a 32-bit LE value at byte offset `off` within `buf`.
+ * Used to patch the UART base, dump address, and length fields in the
+ * ARM32/ARM64 dump stub before uploading it to the MaskROM.
+ */
+static inline void put_le32_at(uint8_t *buf, size_t off, uint32_t v)
+{
+	buf[off + 0] = (uint8_t)(v);
+	buf[off + 1] = (uint8_t)(v >> 8);
+	buf[off + 2] = (uint8_t)(v >> 16);
+	buf[off + 3] = (uint8_t)(v >> 24);
+}
+
+/*
+ * ARM32 hexdump stub.  When uploaded via the 0x471 MaskROM control
+ * transfer the chip CPU executes it immediately.  The stub reads
+ * `len` bytes from `addr` and writes them as hex to the 16550-
+ * compatible UART whose MMIO base is `uart`.  Nothing comes back over
+ * USB; connect a serial adapter to capture the output.
+ *
+ * Parameter patch offsets (little-endian 32-bit words):
+ *   0x1c  UART MMIO base address
+ *   0x20  start address of the region to dump
+ *   0x24  byte count
+ *
+ * ARM32 hexdump stub.
+ */
+int rkusb_maskrom_dump_arm32(struct rkusb *u, uint32_t uart,
+                              uint32_t addr, uint32_t len, int rc4_on)
+{
+	/* Binary from payloads/dump_arm32.s — see that file for full annotation. */
+	uint8_t *buf = malloc(sizeof(dump_arm32_tmpl));
+	if (!buf)
+		return -ENOMEM;
+	memcpy(buf, dump_arm32_tmpl, sizeof(dump_arm32_tmpl));
+
+	/* Patch UART base, dump address, and byte count (LE32 each). */
+	put_le32_at(buf, 0x1c, uart);
+	put_le32_at(buf, 0x20, addr);
+	put_le32_at(buf, 0x24, len);
+
+	if (rc4_on)
+		rk_rc4(buf, sizeof(dump_arm32_tmpl));
+
+	int rc = rkusb_ctrl_download(u, RKUSB_CTRL_REQ_DDR_INIT,
+	                             buf, sizeof(dump_arm32_tmpl));
+	free(buf);
+	return rc;
+}
+
+/*
+ * ARM64 hexdump stub.  Same concept as the ARM32 variant above.
+ *
+ * Parameter patch offsets (little-endian 32-bit words):
+ *   0x0c  UART MMIO base address
+ *   0x10  start address of the region to dump
+ *   0x14  byte count
+ *
+ * ARM64 hexdump stub.
+ */
+int rkusb_maskrom_dump_arm64(struct rkusb *u, uint32_t uart,
+                              uint32_t addr, uint32_t len, int rc4_on)
+{
+	/* Binary from payloads/dump_arm64.s — see that file for full annotation. */
+	uint8_t *buf = malloc(sizeof(dump_arm64_tmpl));
+	if (!buf)
+		return -ENOMEM;
+	memcpy(buf, dump_arm64_tmpl, sizeof(dump_arm64_tmpl));
+
+	/* Patch UART base, dump address, and byte count (LE32 each). */
+	put_le32_at(buf, 0x0c, uart);
+	put_le32_at(buf, 0x10, addr);
+	put_le32_at(buf, 0x14, len);
+
+	if (rc4_on)
+		rk_rc4(buf, sizeof(dump_arm64_tmpl));
+
+	int rc = rkusb_ctrl_download(u, RKUSB_CTRL_REQ_DDR_INIT,
+	                             buf, sizeof(dump_arm64_tmpl));
+	free(buf);
+	return rc;
 }

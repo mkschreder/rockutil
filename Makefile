@@ -37,9 +37,22 @@ SRCS := rockutil.c rkusb.c rkcrc.c rkrc4.c rkimage.c rkparam.c rksparse.c
 OBJS := $(SRCS:.c=.o)
 DEPS := $(SRCS:.c=.d)
 
-.PHONY: all clean install uninstall check
+PAYLOAD_DIR   := payloads
+PAYLOAD_HDRS  := $(PAYLOAD_DIR)/dump_arm32.h $(PAYLOAD_DIR)/dump_arm64.h
 
-all: $(TARGET)
+.PHONY: all payloads verify-payloads clean install uninstall check
+
+all: payloads $(TARGET)
+
+# Build the ARM32 and ARM64 hexdump payload headers from assembly source.
+payloads: $(PAYLOAD_HDRS)
+
+$(PAYLOAD_HDRS): $(wildcard $(PAYLOAD_DIR)/*.s)
+	$(MAKE) -C $(PAYLOAD_DIR) all
+
+# Verify that the assembled payloads are bit-perfect against rkusb.c arrays.
+verify-payloads: $(PAYLOAD_HDRS)
+	$(MAKE) -C $(PAYLOAD_DIR) verify
 
 $(TARGET): $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
@@ -51,6 +64,7 @@ $(TARGET): $(OBJS)
 
 clean:
 	$(RM) $(OBJS) $(DEPS) $(TARGET)
+	$(MAKE) -C $(PAYLOAD_DIR) clean
 
 check: $(TARGET)
 	./$(TARGET) -v
