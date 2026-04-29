@@ -1916,7 +1916,14 @@ static int cmd_erase_flash(int argc, char **argv)
 /*
  * Context used by img_sparse_cb and img_write_block while writing a
  * single partition's data into the flat output file.
+ *
+ * For SPI-NAND (Rockchip RV1106 / Luckfox style) the RKAF nand_addr
+ * field uses 64-byte LBA units, not the 512-byte sectors used by the
+ * Rockusb USB protocol.  All byte-offset arithmetic in the MKIMG path
+ * uses MKIMG_NAND_UNIT instead of RKUSB_SECTOR_BYTES.
  */
+#define MKIMG_NAND_UNIT 64u
+
 struct img_ctx {
 	FILE       *fp;
 	uint32_t    base_lba;
@@ -1930,12 +1937,12 @@ static int img_write_block(struct img_ctx *ctx, uint32_t offset_lba,
                            const uint8_t *data, uint32_t sectors)
 {
 	off_t byte_off =
-		(off_t)(ctx->base_lba + offset_lba) * RKUSB_SECTOR_BYTES;
+		(off_t)(ctx->base_lba + offset_lba) * MKIMG_NAND_UNIT;
 	if (fseeko(ctx->fp, byte_off, SEEK_SET) != 0) {
 		fprintf(stderr, "fseeko failed: %s\n", strerror(errno));
 		return -EIO;
 	}
-	size_t bytes = (size_t)sectors * RKUSB_SECTOR_BYTES;
+	size_t bytes = (size_t)sectors * MKIMG_NAND_UNIT;
 	if (fwrite(data, 1, bytes, ctx->fp) != bytes) {
 		fprintf(stderr, "fwrite failed: %s\n", strerror(errno));
 		return -EIO;
@@ -1954,17 +1961,17 @@ static int img_sparse_cb(void *user, uint32_t lba, const uint8_t *data,
 		return img_write_block(ctx, lba, data, sectors);
 
 	/* FILL chunk: expand the 32-bit pattern into a sector buffer. */
-	uint8_t sec[RKUSB_SECTOR_BYTES];
+	uint8_t sec[MKIMG_NAND_UNIT];
 	for (size_t i = 0; i < sizeof(sec); i += 4)
 		memcpy(sec + i, &fill_word, 4);
 	while (sectors) {
 		uint32_t step = sectors > RKUSB_MAX_LBA_SECTORS
 		                ? RKUSB_MAX_LBA_SECTORS : sectors;
 		static uint8_t scratch[RKUSB_MAX_LBA_SECTORS *
-		                       RKUSB_SECTOR_BYTES];
+		                       MKIMG_NAND_UNIT];
 		for (uint32_t s = 0; s < step; ++s)
-			memcpy(scratch + (size_t)s * RKUSB_SECTOR_BYTES,
-			       sec, RKUSB_SECTOR_BYTES);
+			memcpy(scratch + (size_t)s * MKIMG_NAND_UNIT,
+			       sec, MKIMG_NAND_UNIT);
 		int rc = img_write_block(ctx, lba, scratch, step);
 		if (rc < 0)
 			return rc;
@@ -2004,9 +2011,9 @@ static int image_partition(FILE *fp, uint32_t base_lba,
 
 	/* Raw image: write in sector-aligned chunks, zero-pad partial tail. */
 	size_t total_sectors =
-		(data_len + RKUSB_SECTOR_BYTES - 1) / RKUSB_SECTOR_BYTES;
-	size_t full_bytes = total_sectors * RKUSB_SECTOR_BYTES;
-	uint8_t chunk[RKUSB_MAX_LBA_SECTORS * RKUSB_SECTOR_BYTES];
+		(data_len + MKIMG_NAND_UNIT - 1) / MKIMG_NAND_UNIT;
+	size_t full_bytes = total_sectors * MKIMG_NAND_UNIT;
+	uint8_t chunk[RKUSB_MAX_LBA_SECTORS * MKIMG_NAND_UNIT];
 	size_t off = 0;
 	uint32_t lba = 0;
 	ctx.total = full_bytes;
@@ -2014,7 +2021,7 @@ static int image_partition(FILE *fp, uint32_t base_lba,
 	while (total_sectors) {
 		size_t step = total_sectors > RKUSB_MAX_LBA_SECTORS
 		              ? RKUSB_MAX_LBA_SECTORS : total_sectors;
-		size_t want = step * RKUSB_SECTOR_BYTES;
+		size_t want = step * MKIMG_NAND_UNIT;
 		memset(chunk, 0, want);
 		size_t copy = data_len - off;
 		if (copy > want)
@@ -2037,7 +2044,7 @@ static int cmd_mkimg(int argc, char **argv)
 		        "Usage: MKIMG <firmware.img> <output.bin>"
 		        " [--size <sectors>]\n"
 		        "  --size  total flash size in 512-byte sectors"
-		        " (default: derived from image)\n");
+		        " as reported by RFI (converted to 64-byte NAND units internally)\n");
 		return 1;
 	}
 
@@ -2057,7 +2064,11 @@ static int cmd_mkimg(int argc, char **argv)
 	}
 	rkaf_print(&f.image);
 
-	/* Parse optional --size override (in 512-byte sectors). */
+	/*
+	 * Parse optional --size override.  The value is in 512-byte sectors
+	 * as reported by the RFI command; it is converted to 64-byte NAND
+	 * LBA units internally (x8).
+	 */
 	unsigned long forced_sectors = 0;
 	for (int i = 2; i + 1 < argc; i += 2) {
 		if (!strcmp(argv[i], "--size") &&
@@ -2066,13 +2077,15 @@ static int cmd_mkimg(int argc, char **argv)
 	}
 
 	/*
-	 * Determine total image size.  When --size is omitted, scan the
-	 * RKAF partition table and use the end of the last data partition
-	 * (base_lba + image_size_in_sectors) as the minimum image size.
-	 * Pass --size <total_flash_sectors> (e.g. obtained from RFI) for
-	 * a complete flash-sized image with correct trailing free space.
+	 * Determine total image size in 64-byte NAND LBA units.
+	 * When --size is omitted, scan the RKAF partition table and use
+	 * the end of the last data partition as the minimum image size.
+	 * Pass --size <total_flash_sectors> (e.g. obtained from RFI, in
+	 * 512-byte sectors) to include the full flash capacity.
 	 */
-	uint64_t total_sectors = forced_sectors;
+	/* Convert RFI 512-byte sectors to 64-byte NAND units (x8). */
+	uint64_t total_sectors = forced_sectors
+	                         * (RKUSB_SECTOR_BYTES / MKIMG_NAND_UNIT);
 	if (total_sectors == 0) {
 		for (uint32_t i = 0;
 		     i < f.image.hdr->num_parts && i < 16; ++i) {
@@ -2083,9 +2096,10 @@ static int cmd_mkimg(int argc, char **argv)
 				(strncmp(p->name, "parameter",
 				         sizeof(p->name)) == 0)
 				? 0 : p->nand_addr;
+			/* image_size is in bytes; convert to 64-byte NAND units. */
 			uint64_t img_sects =
-				((uint64_t)p->image_size + RKUSB_SECTOR_BYTES - 1)
-				/ RKUSB_SECTOR_BYTES;
+				((uint64_t)p->image_size + MKIMG_NAND_UNIT - 1)
+				/ MKIMG_NAND_UNIT;
 			uint64_t end = (uint64_t)base + img_sects;
 			if (end > total_sectors)
 				total_sectors = end;
@@ -2098,10 +2112,10 @@ static int cmd_mkimg(int argc, char **argv)
 		return 1;
 	}
 
-	uint64_t img_bytes = total_sectors * RKUSB_SECTOR_BYTES;
+	uint64_t img_bytes = total_sectors * MKIMG_NAND_UNIT;
 	fprintf(stderr,
 	        "Creating NAND image: %s\n"
-	        "  %" PRIu64 " sectors  (%" PRIu64 " MiB)\n",
+	        "  %" PRIu64 " NAND units  (%" PRIu64 " MiB)\n",
 	        argv[1], total_sectors, img_bytes / (1024 * 1024));
 	if (!forced_sectors)
 		fprintf(stderr,
@@ -2168,7 +2182,7 @@ static int cmd_mkimg(int argc, char **argv)
 		        "\nPartition %-12.32s @ LBA 0x%08x"
 		        "  (offset 0x%08" PRIx64 ")  img=%" PRIu64 " KiB\n",
 		        p->name, base,
-		        (uint64_t)base * RKUSB_SECTOR_BYTES,
+		        (uint64_t)base * MKIMG_NAND_UNIT,
 		        (uint64_t)len / 1024);
 		rc = image_partition(out, base, buf, len, p->name);
 		free(buf);
