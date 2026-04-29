@@ -2165,8 +2165,13 @@ static int cmd_mkimg(int argc, char **argv)
 			base = 0;
 
 		fprintf(stderr,
-		        "\nPartition %-12.32s @ LBA 0x%08x  img=%zu B\n",
-		        p->name, base, len);
+		        "\nPartition %-12.32s @ LBA 0x%08x"
+		        "  (byte offset 0x%012" PRIx64 " / %" PRIu64 " MiB)"
+		        "  img=%zu B\n",
+		        p->name, base,
+		        (uint64_t)base * RKUSB_SECTOR_BYTES,
+		        ((uint64_t)base * RKUSB_SECTOR_BYTES) / (1024 * 1024),
+		        len);
 		rc = image_partition(out, base, buf, len, p->name);
 		free(buf);
 	}
