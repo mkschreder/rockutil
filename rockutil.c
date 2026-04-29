@@ -38,6 +38,8 @@
  *   EF  <parameter.txt>           erase flash (per-partition)
  *   PRINT <firmware.img>          dump RKFW / RKBOOT / RKAF header info
  *   SS  <storage>                 switch storage (emmc|nand|sd|spinor|spinand)
+ *   MKIMG <firmware.img> <out.bin> [--size <sectors>]
+ *                                 build flat NAND binary image (no device needed)
  */
 #include <errno.h>
 #include <inttypes.h>
@@ -119,14 +121,16 @@ static void print_usage(void)
 	"PackBoot:         PACK <chip_hex> <ddr.bin> <usb.bin> <ldr.bin> <out.bin>\n"
 	"UnpackBoot:       UNPACK <loader.bin> <outdir>\n"
 	"TagSPL:           TAGSPL <chip_hex> <spl.bin> <out.bin>\n"
-	"DumpSDRAM:        DUMP <addr_hex> <len> [outfile]\n"
-	"WriteSDRAM:       WRITE <addr_hex> <file>\n"
-	"ExecSDRAM:        EXEC <addr_hex>\n"
+"DumpSDRAM:        DUMP <addr_hex> <len> [outfile]\n"
+"WriteSDRAM:       WRITE <addr_hex> <file>\n"
+"ExecSDRAM:        EXEC <addr_hex>\n"
+"MaskromDump:      MASKROM-DUMP arm32|arm64 <addr_hex> <len> [--uart <base>] [--rc4 on|off]\n"
 	"OTPRead:          OTP <len> [outfile]\n"
 	"SerialNumber:     SN [string]\n"
 	"VendorStorage:    VS dump <idx> <len> | read <idx> <len> <file> | write <idx> <file>\n"
 	"SwitchStorage:    SS  <emmc|nand|sd|spinor|spinand>\n"
 	"Storage:          STORAGE [emmc|nand|sd|spinor|spinand]\n"
+	"MakeNANDImage:    MKIMG <firmware.img> <out.bin> [--size <sectors>]\n"
 	"-------------------------------------------------------\n",
 	stdout);
 }
@@ -1906,6 +1910,281 @@ static int cmd_erase_flash(int argc, char **argv)
 }
 
 /* ------------------------------------------------------------------ */
+/* MKIMG - build a flat NAND binary image from an RKFW package        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Context used by img_sparse_cb and img_write_block while writing a
+ * single partition's data into the flat output file.
+ */
+struct img_ctx {
+	FILE       *fp;
+	uint32_t    base_lba;
+	const char *label;
+	uint64_t    written;
+	uint64_t    total;
+};
+
+/* Write `sectors` sectors of `data` at (base_lba + offset_lba) in the image. */
+static int img_write_block(struct img_ctx *ctx, uint32_t offset_lba,
+                           const uint8_t *data, uint32_t sectors)
+{
+	off_t byte_off =
+		(off_t)(ctx->base_lba + offset_lba) * RKUSB_SECTOR_BYTES;
+	if (fseeko(ctx->fp, byte_off, SEEK_SET) != 0) {
+		fprintf(stderr, "fseeko failed: %s\n", strerror(errno));
+		return -EIO;
+	}
+	size_t bytes = (size_t)sectors * RKUSB_SECTOR_BYTES;
+	if (fwrite(data, 1, bytes, ctx->fp) != bytes) {
+		fprintf(stderr, "fwrite failed: %s\n", strerror(errno));
+		return -EIO;
+	}
+	ctx->written += bytes;
+	progress(ctx->label, ctx->written, ctx->total);
+	return 0;
+}
+
+/* rksparse_write_fn callback: write RAW chunks, expand FILL chunks. */
+static int img_sparse_cb(void *user, uint32_t lba, const uint8_t *data,
+                         uint32_t sectors, uint32_t fill_word)
+{
+	struct img_ctx *ctx = user;
+	if (data)
+		return img_write_block(ctx, lba, data, sectors);
+
+	/* FILL chunk: expand the 32-bit pattern into a sector buffer. */
+	uint8_t sec[RKUSB_SECTOR_BYTES];
+	for (size_t i = 0; i < sizeof(sec); i += 4)
+		memcpy(sec + i, &fill_word, 4);
+	while (sectors) {
+		uint32_t step = sectors > RKUSB_MAX_LBA_SECTORS
+		                ? RKUSB_MAX_LBA_SECTORS : sectors;
+		static uint8_t scratch[RKUSB_MAX_LBA_SECTORS *
+		                       RKUSB_SECTOR_BYTES];
+		for (uint32_t s = 0; s < step; ++s)
+			memcpy(scratch + (size_t)s * RKUSB_SECTOR_BYTES,
+			       sec, RKUSB_SECTOR_BYTES);
+		int rc = img_write_block(ctx, lba, scratch, step);
+		if (rc < 0)
+			return rc;
+		lba     += step;
+		sectors -= step;
+	}
+	return 0;
+}
+
+/*
+ * Write a single partition's data into the flat binary image file.
+ * Handles both raw/UBI images (sector-aligned, zero-padded tail) and
+ * sparse images (expanded via rksparse_expand).
+ * DON'T CARE regions in sparse images remain at the 0xFF background.
+ */
+static int image_partition(FILE *fp, uint32_t base_lba,
+                           const uint8_t *data, size_t data_len,
+                           const char *label)
+{
+	struct img_ctx ctx = {
+		.fp       = fp,
+		.base_lba = base_lba,
+		.label    = label,
+		.total    = data_len,
+	};
+
+	if (rksparse_is_sparse(data, data_len)) {
+		int rc = rksparse_expand(data, data_len, img_sparse_cb, &ctx);
+		if (rc < 0) {
+			fprintf(stderr, "sparse expand failed for %s: %d\n",
+			        label, rc);
+			return rc;
+		}
+		progress(label, ctx.total, ctx.total);
+		return 0;
+	}
+
+	/* Raw image: write in sector-aligned chunks, zero-pad partial tail. */
+	size_t total_sectors =
+		(data_len + RKUSB_SECTOR_BYTES - 1) / RKUSB_SECTOR_BYTES;
+	size_t full_bytes = total_sectors * RKUSB_SECTOR_BYTES;
+	uint8_t chunk[RKUSB_MAX_LBA_SECTORS * RKUSB_SECTOR_BYTES];
+	size_t off = 0;
+	uint32_t lba = 0;
+	ctx.total = full_bytes;
+
+	while (total_sectors) {
+		size_t step = total_sectors > RKUSB_MAX_LBA_SECTORS
+		              ? RKUSB_MAX_LBA_SECTORS : total_sectors;
+		size_t want = step * RKUSB_SECTOR_BYTES;
+		memset(chunk, 0, want);
+		size_t copy = data_len - off;
+		if (copy > want)
+			copy = want;
+		memcpy(chunk, data + off, copy);
+		int rc = img_write_block(&ctx, lba, chunk, (uint32_t)step);
+		if (rc < 0)
+			return rc;
+		off           += copy;
+		lba           += (uint32_t)step;
+		total_sectors -= step;
+	}
+	return 0;
+}
+
+static int cmd_mkimg(int argc, char **argv)
+{
+	if (argc < 2) {
+		fprintf(stderr,
+		        "Usage: MKIMG <firmware.img> <output.bin>"
+		        " [--size <sectors>]\n"
+		        "  --size  total flash size in 512-byte sectors"
+		        " (default: derived from image)\n");
+		return 1;
+	}
+
+	struct rkfw f;
+	int rc = rkfw_open(&f, argv[0]);
+	if (rc < 0) {
+		fprintf(stderr, "open RKFW %s: %d\n", argv[0], rc);
+		return 1;
+	}
+	rkfw_print(&f);
+
+	rc = rkfw_load_image(&f);
+	if (rc < 0) {
+		fprintf(stderr, "load image: %d\n", rc);
+		rkfw_close(&f);
+		return 1;
+	}
+	rkaf_print(&f.image);
+
+	/* Parse optional --size override (in 512-byte sectors). */
+	unsigned long forced_sectors = 0;
+	for (int i = 2; i + 1 < argc; i += 2) {
+		if (!strcmp(argv[i], "--size") &&
+		    parse_ulong(argv[i + 1], &forced_sectors) == 0)
+			continue;
+	}
+
+	/*
+	 * Determine total image size.  When --size is omitted, scan the
+	 * RKAF partition table and use the end of the last data partition
+	 * (base_lba + image_size_in_sectors) as the minimum image size.
+	 * Pass --size <total_flash_sectors> (e.g. obtained from RFI) for
+	 * a complete flash-sized image with correct trailing free space.
+	 */
+	uint64_t total_sectors = forced_sectors;
+	if (total_sectors == 0) {
+		for (uint32_t i = 0;
+		     i < f.image.hdr->num_parts && i < 16; ++i) {
+			const struct rkaf_part *p = &f.image.hdr->parts[i];
+			if (p->nand_addr == 0xffffffffu || p->image_size == 0)
+				continue;
+			uint32_t base =
+				(strncmp(p->name, "parameter",
+				         sizeof(p->name)) == 0)
+				? 0 : p->nand_addr;
+			uint64_t img_sects =
+				((uint64_t)p->image_size + RKUSB_SECTOR_BYTES - 1)
+				/ RKUSB_SECTOR_BYTES;
+			uint64_t end = (uint64_t)base + img_sects;
+			if (end > total_sectors)
+				total_sectors = end;
+		}
+	}
+
+	if (total_sectors == 0) {
+		fprintf(stderr, "MKIMG: cannot determine image size\n");
+		rkfw_close(&f);
+		return 1;
+	}
+
+	uint64_t img_bytes = total_sectors * RKUSB_SECTOR_BYTES;
+	fprintf(stderr,
+	        "Creating NAND image: %s\n"
+	        "  %" PRIu64 " sectors  (%" PRIu64 " MiB)\n",
+	        argv[1], total_sectors, img_bytes / (1024 * 1024));
+	if (!forced_sectors)
+		fprintf(stderr,
+		        "  Tip: pass --size <total_flash_sectors> to include"
+		        " the full flash capacity (see RFI output).\n");
+
+	FILE *out = fopen(argv[1], "wb");
+	if (!out) {
+		fprintf(stderr, "open %s: %s\n", argv[1], strerror(errno));
+		rkfw_close(&f);
+		return 1;
+	}
+
+	/*
+	 * Pre-fill the entire image with 0xFF — the erased state of NAND
+	 * flash — so unwritten regions look correctly erased to a flash
+	 * programmer rather than appearing as all-zeros.
+	 */
+	{
+		uint8_t fill[65536];
+		memset(fill, 0xff, sizeof(fill));
+		uint64_t remaining = img_bytes;
+		while (remaining) {
+			size_t step = remaining > sizeof(fill)
+			              ? sizeof(fill) : (size_t)remaining;
+			if (fwrite(fill, 1, step, out) != step) {
+				fprintf(stderr, "pre-fill failed: %s\n",
+				        strerror(errno));
+				fclose(out);
+				rkfw_close(&f);
+				return 1;
+			}
+			remaining -= step;
+		}
+	}
+
+	/* Write each non-meta partition at its correct LBA offset. */
+	for (uint32_t i = 0;
+	     i < f.image.hdr->num_parts && i < 16 && rc == 0;
+	     ++i) {
+		const struct rkaf_part *p = &f.image.hdr->parts[i];
+		if (p->image_size == 0)
+			continue;
+		if (p->nand_addr == 0xffffffffu) {
+			fprintf(stderr,
+			        "Skipping meta partition %-12.32s (%u B)\n",
+			        p->name, p->image_size);
+			continue;
+		}
+
+		uint8_t *buf = NULL;
+		size_t   len = 0;
+		rc = rkaf_copy_part(&f.image, p, &buf, &len);
+		if (rc < 0) {
+			fprintf(stderr, "copy %s: %d\n", p->name, rc);
+			break;
+		}
+
+		uint32_t base = p->nand_addr;
+		if (strncmp(p->name, "parameter", sizeof(p->name)) == 0)
+			base = 0;
+
+		fprintf(stderr,
+		        "\nPartition %-12.32s @ LBA 0x%08x  img=%zu B\n",
+		        p->name, base, len);
+		rc = image_partition(out, base, buf, len, p->name);
+		free(buf);
+	}
+
+	fclose(out);
+	rkfw_close(&f);
+
+	if (rc == 0) {
+		printf("NAND image written to %s"
+		       " (%" PRIu64 " MiB)\n",
+		       argv[1], img_bytes / (1024 * 1024));
+		return 0;
+	}
+	fprintf(stderr, "MKIMG failed (%d)\n", rc);
+	return 1;
+}
+
+/* ------------------------------------------------------------------ */
 /* PRINT - introspect an RKFW/RKBOOT/RKAF                             */
 /* ------------------------------------------------------------------ */
 static int cmd_print(int argc, char **argv)
@@ -2640,6 +2919,115 @@ static int cmd_sn(int argc, char **argv)
 }
 
 /* ------------------------------------------------------------------ */
+/* MASKROM-DUMP - bootrom/memory dump via UART-output payload          */
+/* ------------------------------------------------------------------ */
+static int cmd_maskrom_dump(int argc, char **argv)
+{
+	if (argc < 3) {
+		fprintf(stderr,
+		        "Usage: MASKROM-DUMP arm32|arm64 <addr_hex> <len>"
+		        " [--uart <base>] [--rc4 on|off]\n");
+		return 1;
+	}
+
+	const char *arch = argv[0];
+	bool arm32;
+	if (!strcasecmp(arch, "arm32")) {
+		arm32 = true;
+	} else if (!strcasecmp(arch, "arm64")) {
+		arm32 = false;
+	} else {
+		fprintf(stderr,
+		        "MASKROM-DUMP: arch must be 'arm32' or 'arm64'\n");
+		return 1;
+	}
+
+	unsigned long addr = 0, len = 0, uart = 0;
+	int rc4_on = 0;
+	int pos = 0; /* 0 = waiting for addr, 1 = waiting for len */
+
+	for (int i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "--uart") && i + 1 < argc) {
+			if (parse_ulong(argv[++i], &uart)) {
+				fprintf(stderr, "Invalid uart base '%s'\n",
+				        argv[i]);
+				return 1;
+			}
+		} else if (!strcmp(argv[i], "--rc4") && i + 1 < argc) {
+			++i;
+			if (!strcasecmp(argv[i], "on"))
+				rc4_on = 1;
+			else if (!strcasecmp(argv[i], "off"))
+				rc4_on = 0;
+			else {
+				fprintf(stderr,
+				        "MASKROM-DUMP: --rc4 must be on or off\n");
+				return 1;
+			}
+		} else if (pos == 0) {
+			if (parse_ulong(argv[i], &addr)) {
+				fprintf(stderr, "Invalid address '%s'\n",
+				        argv[i]);
+				return 1;
+			}
+			pos++;
+		} else if (pos == 1) {
+			if (parse_ulong(argv[i], &len)) {
+				fprintf(stderr, "Invalid length '%s'\n",
+				        argv[i]);
+				return 1;
+			}
+			pos++;
+		} else {
+			fprintf(stderr,
+			        "MASKROM-DUMP: unexpected argument '%s'\n",
+			        argv[i]);
+			return 1;
+		}
+	}
+
+	if (pos < 2) {
+		fprintf(stderr,
+		        "MASKROM-DUMP: missing address and/or length\n");
+		return 1;
+	}
+
+	struct rkusb u;
+	int rc = open_selected(&u);
+	if (rc < 0)
+		return 1;
+
+	if (u.desc.usb_type != RKUSB_MODE_MASKROM) {
+		fprintf(stderr,
+		        "Device is not in MaskROM mode — "
+		        "MASKROM-DUMP requires MaskROM mode.\n");
+		rkusb_close(&u);
+		return 1;
+	}
+
+	printf("MASKROM-DUMP (%s): uart=0x%08lx addr=0x%08lx len=%lu rc4=%s\n",
+	       arch, uart, addr, len, rc4_on ? "on" : "off");
+	printf("Memory output will appear on UART at 0x%08lx\n", uart);
+
+	if (arm32)
+		rc = rkusb_maskrom_dump_arm32(&u, (uint32_t)uart,
+		                              (uint32_t)addr, (uint32_t)len,
+		                              rc4_on);
+	else
+		rc = rkusb_maskrom_dump_arm64(&u, (uint32_t)uart,
+		                              (uint32_t)addr, (uint32_t)len,
+		                              rc4_on);
+	rkusb_close(&u);
+
+	if (rc == 0) {
+		printf("MASKROM-DUMP payload uploaded successfully\n");
+		return 0;
+	}
+	fprintf(stderr, "MASKROM-DUMP failed: %d\n", rc);
+	return 1;
+}
+
+/* ------------------------------------------------------------------ */
 /* VS - vendor storage read/write                                       */
 /* ------------------------------------------------------------------ */
 static int cmd_vs(int argc, char **argv)
@@ -2838,8 +3226,10 @@ static const struct command COMMANDS[] = {
 	{"OTP",         cmd_otp,               1},
 	{"SN",          cmd_sn,                0},
 	{"VS",          cmd_vs,                1},
+	{"MASKROM-DUMP", cmd_maskrom_dump,     3},
 	{"SS",          cmd_switch_storage,    1},
 	{"STORAGE",     cmd_storage,           0},
+	{"MKIMG",       cmd_mkimg,             2},
 };
 
 int main(int argc, char **argv)
