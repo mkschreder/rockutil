@@ -8,3 +8,9 @@ rockutil
 # Test build artefacts (fixtures, op-logs, emulator pid files)
 tests/build/
 usbmon.txt
+usbmon-*.txt
+
+# Captured bootrom dumps and downloaded tools (not part of the source tree)
+bootrom*.txt
+bootrom*.bin
+upgrade_tool
