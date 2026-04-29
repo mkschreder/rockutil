@@ -1918,11 +1918,48 @@ static int cmd_erase_flash(int argc, char **argv)
  * single partition's data into the flat output file.
  *
  * For SPI-NAND (Rockchip RV1106 / Luckfox style) the RKAF nand_addr
- * field uses 64-byte LBA units, not the 512-byte sectors used by the
- * Rockusb USB protocol.  All byte-offset arithmetic in the MKIMG path
- * uses MKIMG_NAND_UNIT instead of RKUSB_SECTOR_BYTES.
+ * field uses 512-byte LBA units (same as the Rockusb USB protocol).
+ * All byte-offset arithmetic in the MKIMG path uses MKIMG_NAND_UNIT.
+ *
+ * The Rockchip BootROM additionally requires a copy of the idblock
+ * header at the secondary loader location (offset 0x8000 = page 16 of
+ * a 2 KiB-page NAND = LBA 0x10 in 512-byte units = sector 64 in the
+ * BootROM's internal 128-byte-sector counting).  This secondary copy
+ * is written by cmd_mkimg after writing the idblock partition.
  */
-#define MKIMG_NAND_UNIT 64u
+#define MKIMG_NAND_UNIT 512u
+
+/*
+ * Rockchip secondary loader offset on SPI NAND.
+ * The BootROM's nor_read_id verify callback always checks sector 64
+ * (sector >> 2 = page 16) for the RKNS magic regardless of which
+ * primary segment it is verifying.  A copy of the idblock header must
+ * therefore be present at this byte offset in the flat NAND image.
+ */
+#define MKIMG_SECONDARY_LOADER_OFFSET 0x8000u
+
+/*
+ * Rockchip block-3 idblock confirmation offset on SPI NAND.
+ *
+ * The BootROM's boot_check_header (cmd 0x014d) performs a second RKNS
+ * scan at the start of NAND block 3 (page 192 on a 64-pages/block device
+ * with 2 KiB pages) to confirm the idblock extends across both block 2
+ * and block 3.  Without RKNS at this offset the confirmation fails and
+ * the BootROM falls back to UART download mode.
+ *
+ * Geometry: idblock base = block 2 = page 128 = offset 0x40000.
+ *           Block size   = 64 pages × 2048 B = 0x20000 B.
+ *           Block 3 base = 0x40000 + 0x20000 = 0x60000 = page 192.
+ *
+ * The first full page (2048 bytes) of the idblock (which starts with
+ * the RKNS magic) is copied to this offset so the scan succeeds.
+ */
+#define MKIMG_NAND_PAGES_PER_BLOCK 64u
+#define MKIMG_NAND_PAGE_SIZE       2048u
+#define MKIMG_NAND_BLOCK_SIZE      (MKIMG_NAND_PAGES_PER_BLOCK * MKIMG_NAND_PAGE_SIZE)
+#define MKIMG_IDBLOCK_BASE_OFFSET  0x40000u   /* idblock at block 2 */
+#define MKIMG_IDBLOCK_BLOCK3_OFFSET \
+	(MKIMG_IDBLOCK_BASE_OFFSET + MKIMG_NAND_BLOCK_SIZE)   /* = 0x60000 */
 
 struct img_ctx {
 	FILE       *fp;
@@ -2044,7 +2081,7 @@ static int cmd_mkimg(int argc, char **argv)
 		        "Usage: MKIMG <firmware.img> <output.bin>"
 		        " [--size <sectors>]\n"
 		        "  --size  total flash size in 512-byte sectors"
-		        " as reported by RFI (converted to 64-byte NAND units internally)\n");
+		        " as reported by RFI\n");
 		return 1;
 	}
 
@@ -2066,8 +2103,7 @@ static int cmd_mkimg(int argc, char **argv)
 
 	/*
 	 * Parse optional --size override.  The value is in 512-byte sectors
-	 * as reported by the RFI command; it is converted to 64-byte NAND
-	 * LBA units internally (x8).
+	 * as reported by the RFI command, which matches MKIMG_NAND_UNIT.
 	 */
 	unsigned long forced_sectors = 0;
 	for (int i = 2; i + 1 < argc; i += 2) {
@@ -2077,15 +2113,13 @@ static int cmd_mkimg(int argc, char **argv)
 	}
 
 	/*
-	 * Determine total image size in 64-byte NAND LBA units.
+	 * Determine total image size in 512-byte NAND LBA units.
 	 * When --size is omitted, scan the RKAF partition table and use
 	 * the end of the last data partition as the minimum image size.
 	 * Pass --size <total_flash_sectors> (e.g. obtained from RFI, in
 	 * 512-byte sectors) to include the full flash capacity.
 	 */
-	/* Convert RFI 512-byte sectors to 64-byte NAND units (x8). */
-	uint64_t total_sectors = forced_sectors
-	                         * (RKUSB_SECTOR_BYTES / MKIMG_NAND_UNIT);
+	uint64_t total_sectors = forced_sectors;
 	if (total_sectors == 0) {
 		for (uint32_t i = 0;
 		     i < f.image.hdr->num_parts && i < 16; ++i) {
@@ -2096,7 +2130,7 @@ static int cmd_mkimg(int argc, char **argv)
 				(strncmp(p->name, "parameter",
 				         sizeof(p->name)) == 0)
 				? 0 : p->nand_addr;
-			/* image_size is in bytes; convert to 64-byte NAND units. */
+			/* image_size is in bytes; convert to 512-byte units. */
 			uint64_t img_sects =
 				((uint64_t)p->image_size + MKIMG_NAND_UNIT - 1)
 				/ MKIMG_NAND_UNIT;
@@ -2185,6 +2219,70 @@ static int cmd_mkimg(int argc, char **argv)
 		        (uint64_t)base * MKIMG_NAND_UNIT,
 		        (uint64_t)len / 1024);
 		rc = image_partition(out, base, buf, len, p->name);
+
+		/*
+		 * The Rockchip BootROM's nor_read_id verify callback always
+		 * checks sector 64 (= page 16 on a 2 KiB-page NAND, byte
+		 * offset 0x8000) for the RKNS magic, in addition to the
+		 * segment's own primary address.  Real Rockchip flash tools
+		 * write the loader to this secondary location via
+		 * WRITE_LOADER.  For the flat NAND image, copy the first
+		 * 512 bytes (one sector) of the idblock to offset 0x8000
+		 * so the BootROM verification succeeds.
+		 */
+		if (rc == 0 &&
+		    strncmp(p->name, "idblock", sizeof(p->name)) == 0) {
+			/* nor_read_id secondary check: page 16 (offset 0x8000) */
+			size_t copy_len = len < 512 ? len : 512;
+			fprintf(stderr,
+			        "  Writing secondary loader copy"
+			        " at offset 0x%08x (%zu B)\n",
+			        MKIMG_SECONDARY_LOADER_OFFSET, copy_len);
+			if (fseeko(out, MKIMG_SECONDARY_LOADER_OFFSET,
+			           SEEK_SET) != 0) {
+				fprintf(stderr,
+				        "fseeko secondary loader: %s\n",
+				        strerror(errno));
+				rc = -EIO;
+			} else if (fwrite(buf, 1, copy_len, out) != copy_len) {
+				fprintf(stderr,
+				        "fwrite secondary loader: %s\n",
+				        strerror(errno));
+				rc = -EIO;
+			}
+
+			/*
+			 * boot_check_header block-3 confirmation: page 192
+			 * (offset 0x60000).  The BootROM scans the first page
+			 * of NAND block 3 for RKNS after loading block 2.
+			 * Copy the first full page (2048 B) of the idblock
+			 * header to that offset so the confirmation succeeds.
+			 */
+			if (rc == 0) {
+				size_t page_len =
+					len < MKIMG_NAND_PAGE_SIZE
+					? len : MKIMG_NAND_PAGE_SIZE;
+				fprintf(stderr,
+				        "  Writing block-3 RKNS copy"
+				        " at offset 0x%08x (%zu B)\n",
+				        MKIMG_IDBLOCK_BLOCK3_OFFSET,
+				        page_len);
+				if (fseeko(out, MKIMG_IDBLOCK_BLOCK3_OFFSET,
+				           SEEK_SET) != 0) {
+					fprintf(stderr,
+					        "fseeko block-3 RKNS: %s\n",
+					        strerror(errno));
+					rc = -EIO;
+				} else if (fwrite(buf, 1, page_len,
+				                  out) != page_len) {
+					fprintf(stderr,
+					        "fwrite block-3 RKNS: %s\n",
+					        strerror(errno));
+					rc = -EIO;
+				}
+			}
+		}
+
 		free(buf);
 	}
 
